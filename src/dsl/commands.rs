@@ -1,5 +1,5 @@
-use crate::dsl::syntax::DSLValue;
 use crate::dsl::error::DSLError;
+use crate::dsl::syntax::DSLValue;
 use std::collections::HashMap;
 
 /// A DSL command that can be executed
@@ -20,32 +20,35 @@ pub enum DSLCommandType {
     GetCluster,
     UpdateCluster,
     WaitForCluster,
-    
+
     // Backup management
     CreateBackup,
     ListBackups,
     DeleteBackup,
     RestoreBackup,
-    
+
     // Pricing
     EstimatePrice,
     GetPricing,
-    
+
     // Control flow
     If,
     Loop,
     Break,
     Continue,
     Return,
-    
+
     // Variables
     SetVariable,
     GetVariable,
-    
+
     // Utility
     Echo,
     Sleep,
     Exit,
+
+    // Logging
+    SetLogLevel,
 }
 
 /// Command execution context
@@ -55,6 +58,12 @@ pub struct CommandContext {
     pub column: usize,
     pub variables: HashMap<String, DSLValue>,
     pub parent_context: Option<Box<CommandContext>>,
+}
+
+impl Default for CommandContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommandContext {
@@ -85,7 +94,9 @@ impl CommandContext {
 
     pub fn get_variable(&self, name: &str) -> Option<&DSLValue> {
         self.variables.get(name).or_else(|| {
-            self.parent_context.as_ref().and_then(|parent| parent.get_variable(name))
+            self.parent_context
+                .as_ref()
+                .and_then(|parent| parent.get_variable(name))
         })
     }
 
@@ -94,8 +105,11 @@ impl CommandContext {
     }
 
     pub fn has_variable(&self, name: &str) -> bool {
-        self.variables.contains_key(name) || 
-        self.parent_context.as_ref().map_or(false, |parent| parent.has_variable(name))
+        self.variables.contains_key(name)
+            || self
+                .parent_context
+                .as_ref()
+                .is_some_and(|parent| parent.has_variable(name))
     }
 }
 
@@ -131,39 +145,33 @@ impl DSLCommand {
         self.parameters
             .get(name)
             .and_then(|v| v.as_string())
-            .ok_or_else(|| DSLError::missing_parameter(
-                format!("{:?}", self.command_type),
-                name.to_string()
-            ))
+            .ok_or_else(|| {
+                DSLError::missing_parameter(format!("{:?}", self.command_type), name.to_string())
+            })
     }
 
     pub fn get_parameter_as_number(&self, name: &str) -> Result<f64, DSLError> {
         self.parameters
             .get(name)
             .and_then(|v| v.as_number())
-            .ok_or_else(|| DSLError::missing_parameter(
-                format!("{:?}", self.command_type),
-                name.to_string()
-            ))
+            .ok_or_else(|| {
+                DSLError::missing_parameter(format!("{:?}", self.command_type), name.to_string())
+            })
     }
 
     pub fn get_parameter_as_boolean(&self, name: &str) -> Result<bool, DSLError> {
         self.parameters
             .get(name)
             .and_then(|v| v.as_boolean())
-            .ok_or_else(|| DSLError::missing_parameter(
-                format!("{:?}", self.command_type),
-                name.to_string()
-            ))
+            .ok_or_else(|| {
+                DSLError::missing_parameter(format!("{:?}", self.command_type), name.to_string())
+            })
     }
 
     pub fn require_parameter(&self, name: &str) -> Result<&DSLValue, DSLError> {
-        self.parameters
-            .get(name)
-            .ok_or_else(|| DSLError::missing_parameter(
-                format!("{:?}", self.command_type),
-                name.to_string()
-            ))
+        self.parameters.get(name).ok_or_else(|| {
+            DSLError::missing_parameter(format!("{:?}", self.command_type), name.to_string())
+        })
     }
 
     pub fn get_optional_parameter(&self, name: &str) -> Option<&DSLValue> {
@@ -429,8 +437,12 @@ impl DSLCommandFactory {
     }
 
     pub fn sleep(seconds: f64) -> DSLCommand {
-        DSLCommand::new(DSLCommandType::Sleep)
-            .with_parameter("seconds", DSLValue::from(seconds))
+        DSLCommand::new(DSLCommandType::Sleep).with_parameter("seconds", DSLValue::from(seconds))
+    }
+
+    pub fn set_log_level(level: impl Into<String>) -> DSLCommand {
+        DSLCommand::new(DSLCommandType::SetLogLevel)
+            .with_parameter("level", DSLValue::from(level.into()))
     }
 }
 
@@ -449,31 +461,37 @@ mod tests {
     fn test_dsl_command_with_parameter() {
         let command = DSLCommand::new(DSLCommandType::CreateCluster)
             .with_parameter("name", DSLValue::from("test-cluster"));
-        
-        assert_eq!(command.get_parameter("name"), Some(&DSLValue::from("test-cluster")));
+
+        assert_eq!(
+            command.get_parameter("name"),
+            Some(&DSLValue::from("test-cluster"))
+        );
     }
 
     #[test]
     fn test_dsl_command_get_parameter_as_string() {
         let command = DSLCommand::new(DSLCommandType::CreateCluster)
             .with_parameter("name", DSLValue::from("test-cluster"));
-        
-        assert_eq!(command.get_parameter_as_string("name").unwrap(), "test-cluster");
+
+        assert_eq!(
+            command.get_parameter_as_string("name").unwrap(),
+            "test-cluster"
+        );
     }
 
     #[test]
     fn test_dsl_command_get_parameter_as_string_error() {
         let command = DSLCommand::new(DSLCommandType::CreateCluster)
             .with_parameter("name", DSLValue::from(42));
-        
+
         assert!(command.get_parameter_as_string("name").is_err());
     }
 
     #[test]
     fn test_dsl_command_get_parameter_as_number() {
-        let command = DSLCommand::new(DSLCommandType::Sleep)
-            .with_parameter("seconds", DSLValue::from(5.5));
-        
+        let command =
+            DSLCommand::new(DSLCommandType::Sleep).with_parameter("seconds", DSLValue::from(5.5));
+
         assert_eq!(command.get_parameter_as_number("seconds").unwrap(), 5.5);
     }
 
@@ -481,7 +499,7 @@ mod tests {
     fn test_dsl_command_get_parameter_as_number_error() {
         let command = DSLCommand::new(DSLCommandType::Sleep)
             .with_parameter("seconds", DSLValue::from("not-a-number"));
-        
+
         assert!(command.get_parameter_as_number("seconds").is_err());
     }
 
@@ -489,14 +507,17 @@ mod tests {
     fn test_dsl_command_require_parameter() {
         let command = DSLCommand::new(DSLCommandType::CreateCluster)
             .with_parameter("name", DSLValue::from("test-cluster"));
-        
-        assert_eq!(command.require_parameter("name").unwrap(), &DSLValue::from("test-cluster"));
+
+        assert_eq!(
+            command.require_parameter("name").unwrap(),
+            &DSLValue::from("test-cluster")
+        );
     }
 
     #[test]
     fn test_dsl_command_require_parameter_missing() {
         let command = DSLCommand::new(DSLCommandType::CreateCluster);
-        
+
         assert!(command.require_parameter("name").is_err());
     }
 
@@ -534,10 +555,12 @@ mod tests {
 
     #[test]
     fn test_dsl_result_with_metadata() {
-        let result = DSLResult::success()
-            .with_metadata("duration", DSLValue::from(100.0));
-        
-        assert_eq!(result.get_metadata("duration"), Some(&DSLValue::from(100.0)));
+        let result = DSLResult::success().with_metadata("duration", DSLValue::from(100.0));
+
+        assert_eq!(
+            result.get_metadata("duration"),
+            Some(&DSLValue::from(100.0))
+        );
     }
 
     #[test]
@@ -552,7 +575,7 @@ mod tests {
     fn test_dsl_batch_result_add_success() {
         let mut batch = DSLBatchResult::new();
         batch.add_result(DSLResult::success());
-        
+
         assert_eq!(batch.success_count, 1);
         assert_eq!(batch.failure_count, 0);
         assert!(batch.is_all_success());
@@ -562,7 +585,7 @@ mod tests {
     fn test_dsl_batch_result_add_failure() {
         let mut batch = DSLBatchResult::new();
         batch.add_result(DSLResult::failure(DSLError::syntax_error(0, "Test error")));
-        
+
         assert_eq!(batch.success_count, 0);
         assert_eq!(batch.failure_count, 1);
         assert!(batch.is_all_failure());
@@ -573,7 +596,7 @@ mod tests {
         let mut batch = DSLBatchResult::new();
         batch.add_result(DSLResult::success());
         batch.add_result(DSLResult::failure(DSLError::syntax_error(0, "Test error")));
-        
+
         assert_eq!(batch.success_count, 1);
         assert_eq!(batch.failure_count, 1);
         assert!(!batch.is_all_success());
@@ -600,24 +623,36 @@ mod tests {
     fn test_command_context_variables() {
         let mut context = CommandContext::new();
         context.set_variable("test_var".to_string(), DSLValue::from("test_value"));
-        
+
         assert!(context.has_variable("test_var"));
-        assert_eq!(context.get_variable("test_var"), Some(&DSLValue::from("test_value")));
+        assert_eq!(
+            context.get_variable("test_var"),
+            Some(&DSLValue::from("test_value"))
+        );
     }
 
     #[test]
     fn test_dsl_command_factory_create_cluster() {
         let command = DSLCommandFactory::create_cluster("test-cluster", "aws-us-west-1");
         assert_eq!(command.command_type, DSLCommandType::CreateCluster);
-        assert_eq!(command.get_parameter_as_string("name").unwrap(), "test-cluster");
-        assert_eq!(command.get_parameter_as_string("region").unwrap(), "aws-us-west-1");
+        assert_eq!(
+            command.get_parameter_as_string("name").unwrap(),
+            "test-cluster"
+        );
+        assert_eq!(
+            command.get_parameter_as_string("region").unwrap(),
+            "aws-us-west-1"
+        );
     }
 
     #[test]
     fn test_dsl_command_factory_delete_cluster() {
         let command = DSLCommandFactory::delete_cluster("test-cluster");
         assert_eq!(command.command_type, DSLCommandType::DeleteCluster);
-        assert_eq!(command.get_parameter_as_string("name").unwrap(), "test-cluster");
+        assert_eq!(
+            command.get_parameter_as_string("name").unwrap(),
+            "test-cluster"
+        );
     }
 
     #[test]
@@ -631,7 +666,10 @@ mod tests {
     fn test_dsl_command_factory_echo() {
         let command = DSLCommandFactory::echo("Hello, World!");
         assert_eq!(command.command_type, DSLCommandType::Echo);
-        assert_eq!(command.get_parameter_as_string("message").unwrap(), "Hello, World!");
+        assert_eq!(
+            command.get_parameter_as_string("message").unwrap(),
+            "Hello, World!"
+        );
     }
 
     #[test]
@@ -640,4 +678,4 @@ mod tests {
         assert_eq!(command.command_type, DSLCommandType::Sleep);
         assert_eq!(command.get_parameter_as_number("seconds").unwrap(), 5.5);
     }
-} 
+}

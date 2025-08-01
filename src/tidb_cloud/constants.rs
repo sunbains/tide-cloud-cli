@@ -1,5 +1,5 @@
 //! TiDB Cloud API Constants
-//! 
+//!
 //! This module contains all the constants used throughout the TiDB Cloud client,
 //! including URLs, API versions, and default values.
 
@@ -92,7 +92,7 @@ pub const DEFAULT_REQUIRE_HTTPS: bool = true;
 pub const DEFAULT_ENABLE_RATE_LIMIT: bool = true;
 
 /// Verbosity levels for debugging
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum VerbosityLevel {
     /// No debug output
     Silent = 0,
@@ -101,17 +101,12 @@ pub enum VerbosityLevel {
     /// Warning and error messages
     Warning = 2,
     /// Info, warning, and error messages
+    #[default]
     Info = 3,
     /// Debug, info, warning, and error messages
     Debug = 4,
     /// Trace, debug, info, warning, and error messages
     Trace = 5,
-}
-
-impl Default for VerbosityLevel {
-    fn default() -> Self {
-        VerbosityLevel::Info
-    }
 }
 
 impl From<u8> for VerbosityLevel {
@@ -138,4 +133,4 @@ impl std::fmt::Display for VerbosityLevel {
             VerbosityLevel::Trace => write!(f, "TRACE"),
         }
     }
-} 
+}

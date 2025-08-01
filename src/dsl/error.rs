@@ -6,23 +6,15 @@ use thiserror::Error;
 pub enum DSLError {
     /// Syntax error in DSL command
     #[error("Syntax error at position {}: {}", position, message)]
-    SyntaxError {
-        position: usize,
-        message: String,
-    },
+    SyntaxError { position: usize, message: String },
 
     /// Unknown command
     #[error("Unknown command: {}", command)]
-    UnknownCommand {
-        command: String,
-    },
+    UnknownCommand { command: String },
 
     /// Missing required parameter
     #[error("Missing required parameter '{}' for command '{}'", parameter, command)]
-    MissingParameter {
-        command: String,
-        parameter: String,
-    },
+    MissingParameter { command: String, parameter: String },
 
     /// Invalid parameter value
     #[error("Invalid value '{}' for parameter '{}': {}", value, parameter, reason)]
@@ -33,7 +25,7 @@ pub enum DSLError {
     },
 
     /// Execution error from underlying TiDB Cloud client
-    #[error("Execution error: {}", message)]
+    #[error("Execution error: {message}")]
     ExecutionError {
         message: String,
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -41,22 +33,15 @@ pub enum DSLError {
 
     /// Type mismatch error
     #[error("Type mismatch: expected {}, got {}", expected, got)]
-    TypeMismatch {
-        expected: String,
-        got: String,
-    },
+    TypeMismatch { expected: String, got: String },
 
     /// Variable not found
     #[error("Variable '{}' not found", name)]
-    VariableNotFound {
-        name: String,
-    },
+    VariableNotFound { name: String },
 
     /// Invalid expression
     #[error("Invalid expression: {}", expression)]
-    InvalidExpression {
-        expression: String,
-    },
+    InvalidExpression { expression: String },
 
     /// Script parsing error
     #[error("Script parsing error: {}", message)]
@@ -75,21 +60,15 @@ pub enum DSLError {
 
     /// Timeout error
     #[error("Operation timed out after {} seconds", timeout_seconds)]
-    TimeoutError {
-        timeout_seconds: u64,
-    },
+    TimeoutError { timeout_seconds: u64 },
 
     /// Resource not found
     #[error("Resource '{}' not found", resource)]
-    ResourceNotFound {
-        resource: String,
-    },
+    ResourceNotFound { resource: String },
 
     /// Permission denied
     #[error("Permission denied: {}", operation)]
-    PermissionDenied {
-        operation: String,
-    },
+    PermissionDenied { operation: String },
 }
 
 impl DSLError {
@@ -138,13 +117,16 @@ impl DSLError {
     }
 
     /// Create an execution error with source
-    pub fn execution_error_with_source(message: impl Into<String>, source: impl Into<String>) -> Self {
+    pub fn execution_error_with_source(
+        message: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        let message = message.into();
+        let source = source.into();
+        let full_message = format!("{message}: {source}");
         Self::ExecutionError {
-            message: message.into(),
-            source: Some(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                source.into()
-            ))),
+            message: full_message,
+            source: None,
         }
     }
 
@@ -158,9 +140,7 @@ impl DSLError {
 
     /// Create a variable not found error
     pub fn variable_not_found(name: impl Into<String>) -> Self {
-        Self::VariableNotFound {
-            name: name.into(),
-        }
+        Self::VariableNotFound { name: name.into() }
     }
 
     /// Create an invalid expression error
@@ -232,6 +212,12 @@ pub struct ErrorContext {
     pub variables: std::collections::HashMap<String, String>,
 }
 
+impl Default for ErrorContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ErrorContext {
     pub fn new() -> Self {
         Self {
@@ -266,20 +252,20 @@ impl ErrorContext {
 impl fmt::Display for ErrorContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(line) = self.line {
-            write!(f, "line {}", line)?;
+            write!(f, "line {line}")?;
             if let Some(column) = self.column {
-                write!(f, ", column {}", column)?;
+                write!(f, ", column {column}")?;
             }
         }
-        
+
         if let Some(command) = &self.command {
-            write!(f, " in command '{}'", command)?;
+            write!(f, " in command '{command}'")?;
         }
-        
+
         if !self.variables.is_empty() {
             write!(f, " with variables: {:?}", self.variables)?;
         }
-        
+
         Ok(())
     }
 }
@@ -292,7 +278,10 @@ mod tests {
     #[test]
     fn test_syntax_error() {
         let error = DSLError::syntax_error(10, "Unexpected token");
-        assert_eq!(error.to_string(), "Syntax error at position 10: Unexpected token");
+        assert_eq!(
+            error.to_string(),
+            "Syntax error at position 10: Unexpected token"
+        );
     }
 
     #[test]
@@ -304,13 +293,19 @@ mod tests {
     #[test]
     fn test_missing_parameter() {
         let error = DSLError::missing_parameter("CREATE", "name");
-        assert_eq!(error.to_string(), "Missing required parameter 'name' for command 'CREATE'");
+        assert_eq!(
+            error.to_string(),
+            "Missing required parameter 'name' for command 'CREATE'"
+        );
     }
 
     #[test]
     fn test_invalid_parameter() {
         let error = DSLError::invalid_parameter("region", "invalid-region", "Not a valid region");
-        assert_eq!(error.to_string(), "Invalid value 'invalid-region' for parameter 'region': Not a valid region");
+        assert_eq!(
+            error.to_string(),
+            "Invalid value 'invalid-region' for parameter 'region': Not a valid region"
+        );
     }
 
     #[test]
@@ -322,14 +317,20 @@ mod tests {
     #[test]
     fn test_execution_error_with_source() {
         let error = DSLError::execution_error_with_source("API call failed", "Network timeout");
-        assert_eq!(error.to_string(), "Execution error: API call failed");
-        assert!(error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "Execution error: API call failed: Network timeout"
+        );
+        assert!(error.source().is_none());
     }
 
     #[test]
     fn test_type_mismatch() {
         let error = DSLError::type_mismatch("String", "Number");
-        assert_eq!(error.to_string(), "Type mismatch: expected String, got Number");
+        assert_eq!(
+            error.to_string(),
+            "Type mismatch: expected String, got Number"
+        );
     }
 
     #[test]
@@ -359,7 +360,10 @@ mod tests {
     #[test]
     fn test_batch_error() {
         let error = DSLError::batch_error(3, "Command failed");
-        assert_eq!(error.to_string(), "Batch execution failed at command 3: Command failed");
+        assert_eq!(
+            error.to_string(),
+            "Batch execution failed at command 3: Command failed"
+        );
     }
 
     #[test]
@@ -391,7 +395,10 @@ mod tests {
         assert_eq!(context.line, Some(10));
         assert_eq!(context.column, Some(5));
         assert_eq!(context.command, Some("CREATE CLUSTER".to_string()));
-        assert_eq!(context.variables.get("name"), Some(&"test-cluster".to_string()));
+        assert_eq!(
+            context.variables.get("name"),
+            Some(&"test-cluster".to_string())
+        );
     }
 
     #[test]
@@ -420,4 +427,4 @@ mod tests {
         assert!(!display.contains("column"));
         assert!(display.contains("CREATE CLUSTER"));
     }
-} 
+}

@@ -1,5 +1,5 @@
-use crate::tidb_cloud::error::{TiDBCloudError, TiDBCloudResult};
 use crate::tidb_cloud::constants::*;
+use crate::tidb_cloud::error::{TiDBCloudError, TiDBCloudResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -167,14 +167,16 @@ impl TiDBCloudConfig {
     /// Load TiDB Cloud configuration from a specific file
     pub fn from_file<P: AsRef<Path>>(path: P) -> TiDBCloudResult<Self> {
         let content = std::fs::read_to_string(&path)
-            .map_err(|e| TiDBCloudError::ConfigError(format!("Failed to read config file: {}", e)))?;
-        
+            .map_err(|e| TiDBCloudError::ConfigError(format!("Failed to read config file: {e}")))?;
+
         if path.as_ref().extension().and_then(|s| s.to_str()) == Some("toml") {
-            toml::from_str(&content)
-                .map_err(|e| TiDBCloudError::ConfigError(format!("Failed to parse TOML config: {}", e)))
+            toml::from_str(&content).map_err(|e| {
+                TiDBCloudError::ConfigError(format!("Failed to parse TOML config: {e}"))
+            })
         } else {
-            serde_json::from_str(&content)
-                .map_err(|e| TiDBCloudError::ConfigError(format!("Failed to parse JSON config: {}", e)))
+            serde_json::from_str(&content).map_err(|e| {
+                TiDBCloudError::ConfigError(format!("Failed to parse JSON config: {e}"))
+            })
         }
     }
 
@@ -199,10 +201,10 @@ impl TiDBCloudConfig {
         }
 
         // Client configuration
-        if let Ok(timeout) = std::env::var("TIDB_CLOUD_TIMEOUT_SECS") {
-            if let Ok(timeout_secs) = timeout.parse() {
-                self.client.timeout_secs = timeout_secs;
-            }
+        if let Ok(timeout) = std::env::var("TIDB_CLOUD_TIMEOUT_SECS")
+            && let Ok(timeout_secs) = timeout.parse()
+        {
+            self.client.timeout_secs = timeout_secs;
         }
         if let Ok(user_agent) = std::env::var("TIDB_CLOUD_USER_AGENT") {
             self.client.user_agent = user_agent;
@@ -217,7 +219,10 @@ impl TiDBCloudConfig {
     /// Get the API key with validation
     pub fn get_api_key(&self) -> TiDBCloudResult<String> {
         self.api.api_key.clone().ok_or_else(|| {
-            TiDBCloudError::ConfigError("TIDB_CLOUD_API_KEY must be provided via config or environment variable".to_string())
+            TiDBCloudError::ConfigError(
+                "TIDB_CLOUD_API_KEY must be provided via config or environment variable"
+                    .to_string(),
+            )
         })
     }
 
@@ -226,27 +231,33 @@ impl TiDBCloudConfig {
         // Validate API key if provided
         if let Some(api_key) = &self.api.api_key {
             if api_key.len() < self.security.min_api_key_length {
-                return Err(TiDBCloudError::ConfigError(
-                    format!("API key too short: {} characters (minimum: {})", 
-                        api_key.len(), self.security.min_api_key_length)
-                ));
+                return Err(TiDBCloudError::ConfigError(format!(
+                    "API key too short: {} characters (minimum: {})",
+                    api_key.len(),
+                    self.security.min_api_key_length
+                )));
             }
             if api_key.len() > self.security.max_api_key_length {
-                return Err(TiDBCloudError::ConfigError(
-                    format!("API key too long: {} characters (maximum: {})", 
-                        api_key.len(), self.security.max_api_key_length)
-                ));
+                return Err(TiDBCloudError::ConfigError(format!(
+                    "API key too long: {} characters (maximum: {})",
+                    api_key.len(),
+                    self.security.max_api_key_length
+                )));
             }
         }
 
         // Validate base URL
         if self.api.base_url.is_empty() {
-            return Err(TiDBCloudError::ConfigError("Base URL cannot be empty".to_string()));
+            return Err(TiDBCloudError::ConfigError(
+                "Base URL cannot be empty".to_string(),
+            ));
         }
 
         // Validate timeout
         if self.client.timeout_secs == 0 {
-            return Err(TiDBCloudError::ConfigError("Timeout must be greater than 0".to_string()));
+            return Err(TiDBCloudError::ConfigError(
+                "Timeout must be greater than 0".to_string(),
+            ));
         }
 
         Ok(())
@@ -299,7 +310,10 @@ mod tests {
         }
 
         let config = TiDBCloudConfig::from_env().unwrap();
-        assert_eq!(config.api.api_key, Some("test-api-key-from-env".to_string()));
+        assert_eq!(
+            config.api.api_key,
+            Some("test-api-key-from-env".to_string())
+        );
         assert_eq!(config.api.base_url, "https://test-api.example.com");
         assert_eq!(config.client.timeout_secs, 60);
 
@@ -326,4 +340,3 @@ mod tests {
         assert_eq!(config.client.timeout_secs, DEFAULT_TIMEOUT_SECS);
     }
 }
-

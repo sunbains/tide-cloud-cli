@@ -33,6 +33,7 @@ pub enum DSLTokenType {
     Return,
     Set,
     Variable,
+    LogLevel,
     Cluster,
     Clusters,
     Backup,
@@ -66,6 +67,10 @@ pub enum DSLTokenType {
     True,
     False,
     Null,
+
+    // SQL-like keywords
+    Select,
+    Asterisk,
 
     // Literals
     String(String),
@@ -144,6 +149,7 @@ impl fmt::Display for DSLTokenType {
             DSLTokenType::Return => write!(f, "RETURN"),
             DSLTokenType::Set => write!(f, "SET"),
             DSLTokenType::Variable => write!(f, "VARIABLE"),
+            DSLTokenType::LogLevel => write!(f, "LOG-LEVEL"),
             DSLTokenType::Cluster => write!(f, "CLUSTER"),
             DSLTokenType::Clusters => write!(f, "CLUSTERS"),
             DSLTokenType::Backup => write!(f, "BACKUP"),
@@ -177,10 +183,12 @@ impl fmt::Display for DSLTokenType {
             DSLTokenType::True => write!(f, "TRUE"),
             DSLTokenType::False => write!(f, "FALSE"),
             DSLTokenType::Null => write!(f, "NULL"),
-            DSLTokenType::String(s) => write!(f, "\"{}\"", s),
-            DSLTokenType::Number(n) => write!(f, "{}", n),
-            DSLTokenType::Identifier(id) => write!(f, "{}", id),
-            DSLTokenType::VariableRef(var) => write!(f, "${}", var),
+            DSLTokenType::Select => write!(f, "SELECT"),
+            DSLTokenType::Asterisk => write!(f, "*"),
+            DSLTokenType::String(s) => write!(f, "\"{s}\""),
+            DSLTokenType::Number(n) => write!(f, "{n}"),
+            DSLTokenType::Identifier(id) => write!(f, "{id}"),
+            DSLTokenType::VariableRef(var) => write!(f, "${var}"),
             DSLTokenType::Equals => write!(f, "=="),
             DSLTokenType::NotEquals => write!(f, "!="),
             DSLTokenType::LessThan => write!(f, "<"),
@@ -212,7 +220,7 @@ impl fmt::Display for DSLTokenType {
             DSLTokenType::Echo => write!(f, "ECHO"),
             DSLTokenType::Sleep => write!(f, "SLEEP"),
             DSLTokenType::EOF => write!(f, "EOF"),
-            DSLTokenType::Error(msg) => write!(f, "ERROR: {}", msg),
+            DSLTokenType::Error(msg) => write!(f, "ERROR: {msg}"),
         }
     }
 }
@@ -227,7 +235,12 @@ pub struct DSLToken {
 }
 
 impl DSLToken {
-    pub fn new(token_type: DSLTokenType, lexeme: impl Into<String>, line: usize, column: usize) -> Self {
+    pub fn new(
+        token_type: DSLTokenType,
+        lexeme: impl Into<String>,
+        line: usize,
+        column: usize,
+    ) -> Self {
         Self {
             token_type,
             lexeme: lexeme.into(),
@@ -239,55 +252,130 @@ impl DSLToken {
     pub fn is_keyword(&self) -> bool {
         matches!(
             self.token_type,
-            DSLTokenType::Create | DSLTokenType::Delete | DSLTokenType::List | DSLTokenType::Get
-                | DSLTokenType::Update | DSLTokenType::Wait | DSLTokenType::For | DSLTokenType::To
-                | DSLTokenType::Be | DSLTokenType::In | DSLTokenType::With | DSLTokenType::Using
-                | DSLTokenType::From | DSLTokenType::Where | DSLTokenType::And | DSLTokenType::Or
-                | DSLTokenType::Not | DSLTokenType::If | DSLTokenType::Then | DSLTokenType::Else
-                | DSLTokenType::End | DSLTokenType::Loop | DSLTokenType::While | DSLTokenType::Do
-                | DSLTokenType::Break | DSLTokenType::Continue | DSLTokenType::Return | DSLTokenType::Set
-                | DSLTokenType::Variable | DSLTokenType::Cluster | DSLTokenType::Clusters
-                | DSLTokenType::Backup | DSLTokenType::Backups | DSLTokenType::Region | DSLTokenType::Regions
-                | DSLTokenType::Price | DSLTokenType::Pricing | DSLTokenType::RCU | DSLTokenType::Storage
-                | DSLTokenType::Plan | DSLTokenType::Service | DSLTokenType::Active | DSLTokenType::Creating
-                | DSLTokenType::Deleting | DSLTokenType::Failed | DSLTokenType::Paused | DSLTokenType::Resuming
-                | DSLTokenType::Suspending | DSLTokenType::Suspended | DSLTokenType::Starter
-                | DSLTokenType::Dedicated | DSLTokenType::Enterprise | DSLTokenType::AWS | DSLTokenType::GCP
-                | DSLTokenType::Azure | DSLTokenType::Seconds | DSLTokenType::Minutes | DSLTokenType::Hours
-                | DSLTokenType::Days | DSLTokenType::True | DSLTokenType::False | DSLTokenType::Null
+            DSLTokenType::Create
+                | DSLTokenType::Delete
+                | DSLTokenType::List
+                | DSLTokenType::Get
+                | DSLTokenType::Update
+                | DSLTokenType::Wait
+                | DSLTokenType::For
+                | DSLTokenType::To
+                | DSLTokenType::Be
+                | DSLTokenType::In
+                | DSLTokenType::With
+                | DSLTokenType::Using
+                | DSLTokenType::From
+                | DSLTokenType::Where
+                | DSLTokenType::And
+                | DSLTokenType::Or
+                | DSLTokenType::Not
+                | DSLTokenType::If
+                | DSLTokenType::Then
+                | DSLTokenType::Else
+                | DSLTokenType::End
+                | DSLTokenType::Loop
+                | DSLTokenType::While
+                | DSLTokenType::Do
+                | DSLTokenType::Break
+                | DSLTokenType::Continue
+                | DSLTokenType::Return
+                | DSLTokenType::Set
+                | DSLTokenType::Variable
+                | DSLTokenType::LogLevel
+                | DSLTokenType::Cluster
+                | DSLTokenType::Clusters
+                | DSLTokenType::Backup
+                | DSLTokenType::Backups
+                | DSLTokenType::Region
+                | DSLTokenType::Regions
+                | DSLTokenType::Price
+                | DSLTokenType::Pricing
+                | DSLTokenType::RCU
+                | DSLTokenType::Storage
+                | DSLTokenType::Plan
+                | DSLTokenType::Service
+                | DSLTokenType::Active
+                | DSLTokenType::Creating
+                | DSLTokenType::Deleting
+                | DSLTokenType::Failed
+                | DSLTokenType::Paused
+                | DSLTokenType::Resuming
+                | DSLTokenType::Suspending
+                | DSLTokenType::Suspended
+                | DSLTokenType::Starter
+                | DSLTokenType::Dedicated
+                | DSLTokenType::Enterprise
+                | DSLTokenType::AWS
+                | DSLTokenType::GCP
+                | DSLTokenType::Azure
+                | DSLTokenType::Seconds
+                | DSLTokenType::Minutes
+                | DSLTokenType::Hours
+                | DSLTokenType::Days
+                | DSLTokenType::True
+                | DSLTokenType::False
+                | DSLTokenType::Null
         )
     }
 
     pub fn is_literal(&self) -> bool {
         matches!(
             self.token_type,
-            DSLTokenType::String(_) | DSLTokenType::Number(_) | DSLTokenType::Identifier(_) | DSLTokenType::VariableRef(_)
+            DSLTokenType::String(_)
+                | DSLTokenType::Number(_)
+                | DSLTokenType::Identifier(_)
+                | DSLTokenType::VariableRef(_)
         )
     }
 
     pub fn is_operator(&self) -> bool {
         matches!(
             self.token_type,
-            DSLTokenType::Equals | DSLTokenType::NotEquals | DSLTokenType::LessThan | DSLTokenType::LessThanOrEqual
-                | DSLTokenType::GreaterThan | DSLTokenType::GreaterThanOrEqual | DSLTokenType::Plus | DSLTokenType::Minus
-                | DSLTokenType::Multiply | DSLTokenType::Divide | DSLTokenType::Modulo | DSLTokenType::Assign
-                | DSLTokenType::PlusAssign | DSLTokenType::MinusAssign | DSLTokenType::MultiplyAssign | DSLTokenType::DivideAssign
+            DSLTokenType::Equals
+                | DSLTokenType::NotEquals
+                | DSLTokenType::LessThan
+                | DSLTokenType::LessThanOrEqual
+                | DSLTokenType::GreaterThan
+                | DSLTokenType::GreaterThanOrEqual
+                | DSLTokenType::Plus
+                | DSLTokenType::Minus
+                | DSLTokenType::Multiply
+                | DSLTokenType::Divide
+                | DSLTokenType::Modulo
+                | DSLTokenType::Assign
+                | DSLTokenType::PlusAssign
+                | DSLTokenType::MinusAssign
+                | DSLTokenType::MultiplyAssign
+                | DSLTokenType::DivideAssign
         )
     }
 
     pub fn is_delimiter(&self) -> bool {
         matches!(
             self.token_type,
-            DSLTokenType::LeftParen | DSLTokenType::RightParen | DSLTokenType::LeftBrace | DSLTokenType::RightBrace
-                | DSLTokenType::LeftBracket | DSLTokenType::RightBracket | DSLTokenType::Comma | DSLTokenType::Semicolon
-                | DSLTokenType::Colon | DSLTokenType::Dot | DSLTokenType::Arrow | DSLTokenType::Range
+            DSLTokenType::LeftParen
+                | DSLTokenType::RightParen
+                | DSLTokenType::LeftBrace
+                | DSLTokenType::RightBrace
+                | DSLTokenType::LeftBracket
+                | DSLTokenType::RightBracket
+                | DSLTokenType::Comma
+                | DSLTokenType::Semicolon
+                | DSLTokenType::Colon
+                | DSLTokenType::Dot
+                | DSLTokenType::Arrow
+                | DSLTokenType::Range
         )
     }
 }
 
 impl fmt::Display for DSLToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at line {}, column {}", self.token_type, self.line, self.column)
+        write!(
+            f,
+            "{} at line {}, column {}",
+            self.token_type, self.line, self.column
+        )
     }
 }
 
@@ -475,9 +563,9 @@ impl DSLValue {
 impl fmt::Display for DSLValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DSLValue::String(s) => write!(f, "\"{}\"", s),
-            DSLValue::Number(n) => write!(f, "{}", n),
-            DSLValue::Boolean(b) => write!(f, "{}", b),
+            DSLValue::String(s) => write!(f, "\"{s}\""),
+            DSLValue::Number(n) => write!(f, "{n}"),
+            DSLValue::Boolean(b) => write!(f, "{b}"),
             DSLValue::Null => write!(f, "null"),
             DSLValue::Array(arr) => {
                 write!(f, "[")?;
@@ -485,7 +573,7 @@ impl fmt::Display for DSLValue {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", item)?;
+                    write!(f, "{item}")?;
                 }
                 write!(f, "]")
             }
@@ -495,7 +583,7 @@ impl fmt::Display for DSLValue {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "\"{}\": {}", key, value)?;
+                    write!(f, "\"{key}\": {value}")?;
                 }
                 write!(f, "}}")
             }
@@ -589,7 +677,7 @@ mod tests {
         assert!(DSLValue::from(42.0).is_truthy());
         assert!(DSLValue::from("hello").is_truthy());
         assert!(DSLValue::from(vec![DSLValue::from(1)]).is_truthy());
-        
+
         assert!(!DSLValue::from(false).is_truthy());
         assert!(!DSLValue::from(0.0).is_truthy());
         assert!(!DSLValue::from("").is_truthy());
@@ -603,10 +691,10 @@ mod tests {
         assert_eq!(DSLValue::from(42.5).to_string(), "42.5");
         assert_eq!(DSLValue::from(true).to_string(), "true");
         assert_eq!(DSLValue::Null.to_string(), "null");
-        
+
         let arr = vec![DSLValue::from("a"), DSLValue::from(1)];
         assert_eq!(DSLValue::from(arr).to_string(), "[\"a\", 1]");
-        
+
         let mut obj = std::collections::HashMap::new();
         obj.insert("key".to_string(), DSLValue::from("value"));
         assert_eq!(DSLValue::from(obj).to_string(), "{\"key\": \"value\"}");
@@ -624,7 +712,7 @@ mod tests {
     fn test_dsl_token_is_keyword() {
         let token = DSLToken::new(DSLTokenType::Create, "CREATE", 1, 1);
         assert!(token.is_keyword());
-        
+
         let token = DSLToken::new(DSLTokenType::Identifier("test".to_string()), "test", 1, 1);
         assert!(!token.is_keyword());
     }
@@ -633,10 +721,10 @@ mod tests {
     fn test_dsl_token_is_literal() {
         let token = DSLToken::new(DSLTokenType::String("test".to_string()), "\"test\"", 1, 1);
         assert!(token.is_literal());
-        
+
         let token = DSLToken::new(DSLTokenType::Number(42.0), "42", 1, 1);
         assert!(token.is_literal());
-        
+
         let token = DSLToken::new(DSLTokenType::Create, "CREATE", 1, 1);
         assert!(!token.is_literal());
     }
@@ -645,7 +733,7 @@ mod tests {
     fn test_dsl_token_is_operator() {
         let token = DSLToken::new(DSLTokenType::Equals, "=", 1, 1);
         assert!(token.is_operator());
-        
+
         let token = DSLToken::new(DSLTokenType::Create, "CREATE", 1, 1);
         assert!(!token.is_operator());
     }
@@ -654,7 +742,7 @@ mod tests {
     fn test_dsl_token_is_delimiter() {
         let token = DSLToken::new(DSLTokenType::LeftParen, "(", 1, 1);
         assert!(token.is_delimiter());
-        
+
         let token = DSLToken::new(DSLTokenType::Create, "CREATE", 1, 1);
         assert!(!token.is_delimiter());
     }
@@ -668,13 +756,19 @@ mod tests {
     #[test]
     fn test_dsl_token_type_display() {
         assert_eq!(DSLTokenType::Create.to_string(), "CREATE");
-        assert_eq!(DSLTokenType::String("test".to_string()).to_string(), "\"test\"");
+        assert_eq!(
+            DSLTokenType::String("test".to_string()).to_string(),
+            "\"test\""
+        );
         assert_eq!(DSLTokenType::Number(42.0).to_string(), "42");
         assert_eq!(DSLTokenType::Equals.to_string(), "==");
         assert_eq!(DSLTokenType::LeftParen.to_string(), "(");
         assert_eq!(DSLTokenType::Echo.to_string(), "ECHO");
         assert_eq!(DSLTokenType::Sleep.to_string(), "SLEEP");
         assert_eq!(DSLTokenType::EOF.to_string(), "EOF");
-        assert_eq!(DSLTokenType::Error("test".to_string()).to_string(), "ERROR: test");
+        assert_eq!(
+            DSLTokenType::Error("test".to_string()).to_string(),
+            "ERROR: test"
+        );
     }
-} 
+}

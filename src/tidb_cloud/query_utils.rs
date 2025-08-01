@@ -1,5 +1,3 @@
-
-
 /// Query parameter builder for common operations
 pub struct QueryBuilder {
     params: Vec<(String, String)>,
@@ -12,7 +10,8 @@ impl QueryBuilder {
 
     /// Add a validate_only parameter
     pub fn validate_only(mut self, validate: bool) -> Self {
-        self.params.push(("validateOnly".to_string(), validate.to_string()));
+        self.params
+            .push(("validateOnly".to_string(), validate.to_string()));
         self
     }
 
@@ -43,9 +42,10 @@ impl QueryBuilder {
         if self.params.is_empty() {
             None
         } else {
-            let query = self.params
+            let query = self
+                .params
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join("&");
             Some(query)
@@ -94,14 +94,14 @@ impl CommonParams {
     /// Build query string from common parameters
     pub fn build_query(&self) -> Option<String> {
         let mut builder = QueryBuilder::new();
-        
+
         if let Some(validate) = self.validate_only {
             builder = builder.validate_only(validate);
         }
-        
+
         builder = builder.page_token(self.page_token.clone());
         builder = builder.page_size(self.page_size);
-        
+
         builder.build()
     }
 }
@@ -119,7 +119,9 @@ pub struct PathBuilder {
 
 impl PathBuilder {
     pub fn new() -> Self {
-        Self { segments: Vec::new() }
+        Self {
+            segments: Vec::new(),
+        }
     }
 
     /// Add a path segment
@@ -136,6 +138,11 @@ impl PathBuilder {
     /// Add backup_id segment
     pub fn backup_id(self, backup_id: &str) -> Self {
         self.segment("backups").segment(backup_id)
+    }
+
+    /// Add backups segment (for listing backups)
+    pub fn backups(self) -> Self {
+        self.segment("backups")
     }
 
     /// Add backup setting segment
@@ -156,6 +163,11 @@ impl PathBuilder {
     /// Add reset root password segment
     pub fn reset_root_password(self) -> Self {
         self.segment("resetRootPassword")
+    }
+
+    /// Add public connection setting segment
+    pub fn public_connection_setting(self) -> Self {
+        self.segment("publicConnectionSetting")
     }
 
     /// Build the path
@@ -254,7 +266,10 @@ mod tests {
             .page_size(Some(50))
             .build();
 
-        assert_eq!(query, Some("validateOnly=true&pageToken=token123&pageSize=50".to_string()));
+        assert_eq!(
+            query,
+            Some("validateOnly=true&pageToken=token123&pageSize=50".to_string())
+        );
     }
 
     #[test]
@@ -271,7 +286,10 @@ mod tests {
             .with_page_size(50);
 
         let query = params.build_query();
-        assert_eq!(query, Some("validateOnly=true&pageToken=token123&pageSize=50".to_string()));
+        assert_eq!(
+            query,
+            Some("validateOnly=true&pageToken=token123&pageSize=50".to_string())
+        );
     }
 
     #[test]
@@ -293,6 +311,9 @@ mod tests {
             .build();
 
         assert_eq!(path, "/tidbs/tidb123/backupSetting");
-        assert_eq!(query, Some("validateOnly=true&pageToken=token123".to_string()));
+        assert_eq!(
+            query,
+            Some("validateOnly=true&pageToken=token123".to_string())
+        );
     }
-} 
+}

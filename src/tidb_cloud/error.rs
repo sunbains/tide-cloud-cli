@@ -1,14 +1,11 @@
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Error type for TiDB Cloud API operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TiDBCloudError {
     /// HTTP request failed
-    HttpError {
-        status: u16,
-        message: String,
-    },
+    HttpError { status: u16, message: String },
     /// Network/transport error
     NetworkError(String),
     /// JSON serialization/deserialization error
@@ -44,48 +41,64 @@ impl fmt::Display for TiDBCloudError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TiDBCloudError::HttpError { status, message } => {
-                write!(f, "HTTP error {}: {}", status, message)
+                write!(f, "HTTP error {status}: {message}")
             }
             TiDBCloudError::NetworkError(msg) => {
-                write!(f, "Network error: {}", msg)
+                write!(f, "Network error: {msg}")
             }
             TiDBCloudError::SerializationError(msg) => {
-                write!(f, "Serialization error: {}", msg)
+                write!(f, "Serialization error: {msg}")
             }
-            TiDBCloudError::ApiError { code, message, details } => {
-                write!(f, "API error {}: {}", code, message)?;
+            TiDBCloudError::ApiError {
+                code,
+                message,
+                details,
+            } => {
+                write!(f, "API error {code}: {message}")?;
                 if let Some(details) = details {
-                    write!(f, " (details: {:?})", details)?;
+                    // Try to extract request ID from details for better debugging
+                    for detail in details {
+                        if let Some(detail_obj) = detail.as_object()
+                            && let Some(request_id) =
+                                detail_obj.get("requestId").and_then(|v| v.as_str())
+                        {
+                            write!(f, " (Request ID: {request_id})")?;
+                            break;
+                        }
+                    }
                 }
                 Ok(())
             }
             TiDBCloudError::ConfigError(msg) => {
-                write!(f, "Configuration error: {}", msg)
+                write!(f, "Configuration error: {msg}")
             }
             TiDBCloudError::AuthError(msg) => {
-                write!(f, "Authentication error: {}", msg)
+                write!(f, "Authentication error: {msg}")
             }
-            TiDBCloudError::RateLimitError { retry_after, message } => {
-                write!(f, "Rate limit error: {}", message)?;
+            TiDBCloudError::RateLimitError {
+                retry_after,
+                message,
+            } => {
+                write!(f, "Rate limit error: {message}")?;
                 if let Some(retry_after) = retry_after {
-                    write!(f, " (retry after {} seconds)", retry_after)?;
+                    write!(f, " (retry after {retry_after} seconds)")?;
                 }
                 Ok(())
             }
             TiDBCloudError::NotFound(resource) => {
-                write!(f, "Resource not found: {}", resource)
+                write!(f, "Resource not found: {resource}")
             }
             TiDBCloudError::AlreadyExists(resource) => {
-                write!(f, "Resource already exists: {}", resource)
+                write!(f, "Resource already exists: {resource}")
             }
             TiDBCloudError::ValidationError(msg) => {
-                write!(f, "Validation error: {}", msg)
+                write!(f, "Validation error: {msg}")
             }
             TiDBCloudError::TimeoutError(msg) => {
-                write!(f, "Timeout error: {}", msg)
+                write!(f, "Timeout error: {msg}")
             }
             TiDBCloudError::Unknown(msg) => {
-                write!(f, "Unknown error: {}", msg)
+                write!(f, "Unknown error: {msg}")
             }
         }
     }
@@ -97,8 +110,6 @@ impl From<reqwest::Error> for TiDBCloudError {
     fn from(err: reqwest::Error) -> Self {
         if err.is_timeout() {
             TiDBCloudError::TimeoutError(err.to_string())
-        } else if err.is_connect() {
-            TiDBCloudError::NetworkError(err.to_string())
         } else {
             TiDBCloudError::NetworkError(err.to_string())
         }
@@ -137,5 +148,3 @@ impl From<GoogleRpcStatus> for TiDBCloudError {
         }
     }
 }
-
- 

@@ -1,10 +1,10 @@
 //! Debug Logger for TiDB Cloud Client
-//! 
+//!
 //! This module provides verbose logging capabilities for debugging TiDB Cloud API interactions.
 //! Uses the common tracing infrastructure for consistent logging across the application.
 
 use crate::tidb_cloud::constants::VerbosityLevel;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Debug logger for TiDB Cloud operations
 #[derive(Clone)]
@@ -20,11 +20,6 @@ impl DebugLogger {
             verbosity,
             enabled: verbosity != VerbosityLevel::Silent,
         }
-    }
-
-    /// Create a logger with default verbosity
-    pub fn default() -> Self {
-        Self::new(VerbosityLevel::default())
     }
 
     /// Check if logging is enabled
@@ -43,7 +38,7 @@ impl DebugLogger {
             match level {
                 VerbosityLevel::Error => error!(target: "tidb_cloud", "{}", message),
                 VerbosityLevel::Warning => warn!(target: "tidb_cloud", "{}", message),
-                VerbosityLevel::Info => info!(target: "tidb_cloud", "{}", message),
+                VerbosityLevel::Info => debug!(target: "tidb_cloud", "{}", message),
                 VerbosityLevel::Debug => debug!(target: "tidb_cloud", "{}", message),
                 VerbosityLevel::Trace => trace!(target: "tidb_cloud", "{}", message),
                 VerbosityLevel::Silent => {}
@@ -79,12 +74,12 @@ impl DebugLogger {
     /// Log API request details
     pub fn log_request(&self, method: &str, url: &str, headers: Option<&str>, body: Option<&str>) {
         if self.verbosity >= VerbosityLevel::Debug {
-            self.debug(&format!("API Request: {} {}", method, url));
-            
+            self.debug(&format!("API Request: {method} {url}"));
+
             if let Some(headers) = headers {
-                self.trace(&format!("Headers: {}", headers));
+                self.trace(&format!("Headers: {headers}"));
             }
-            
+
             if let Some(body) = body {
                 // Truncate body for security
                 let truncated_body = if body.len() > 500 {
@@ -92,7 +87,7 @@ impl DebugLogger {
                 } else {
                     body.to_string()
                 };
-                self.trace(&format!("Body: {}", truncated_body));
+                self.trace(&format!("Body: {truncated_body}"));
             }
         }
     }
@@ -100,58 +95,64 @@ impl DebugLogger {
     /// Log full API query details (for detailed debugging)
     pub fn log_api_query(&self, method: &str, url: &str, body: Option<&str>) {
         if self.verbosity >= VerbosityLevel::Trace {
-            self.trace(&format!("=== FULL API QUERY ==="));
-            self.trace(&format!("Method: {}", method));
-            self.trace(&format!("URL: {}", url));
-            
+            self.trace("=== FULL API QUERY ===");
+            self.trace(&format!("Method: {method}"));
+            self.trace(&format!("URL: {url}"));
+
             if let Some(body) = body {
-                self.trace(&format!("Request Body:"));
+                self.trace("Request Body:");
                 // Log each line of the body with proper trace prefix
                 for line in body.lines() {
                     self.trace(line);
                 }
             }
-            self.trace(&format!("====================="));
+            self.trace("=====================");
         } else if self.verbosity >= VerbosityLevel::Debug {
-            self.debug(&format!("API Query: {} {}", method, url));
+            self.debug(&format!("API Query: {method} {url}"));
             if let Some(body) = body {
                 let truncated_body = if body.len() > 200 {
                     format!("{}... (truncated)", &body[..200])
                 } else {
                     body.to_string()
                 };
-                self.debug(&format!("Body: {}", truncated_body));
+                self.debug(&format!("Body: {truncated_body}"));
             }
         }
     }
 
     /// Log full API query details including headers (for detailed debugging)
-    pub fn log_api_query_with_headers(&self, method: &str, url: &str, headers: Option<&str>, body: Option<&str>) {
+    pub fn log_api_query_with_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: Option<&str>,
+        body: Option<&str>,
+    ) {
         if self.verbosity >= VerbosityLevel::Trace {
-            self.trace(&format!("=== FULL API QUERY WITH HEADERS ==="));
-            self.trace(&format!("Method: {}", method));
-            self.trace(&format!("URL: {}", url));
-            
+            self.trace("=== FULL API QUERY WITH HEADERS ===");
+            self.trace(&format!("Method: {method}"));
+            self.trace(&format!("URL: {url}"));
+
             if let Some(headers) = headers {
-                self.trace(&format!("Request Headers:"));
+                self.trace("Request Headers:");
                 // Log each header line with proper trace prefix
                 for line in headers.lines() {
                     self.trace(line);
                 }
             }
-            
+
             if let Some(body) = body {
-                self.trace(&format!("Request Body:"));
+                self.trace("Request Body:");
                 // Log each line of the body with proper trace prefix
                 for line in body.lines() {
                     self.trace(line);
                 }
             }
-            self.trace(&format!("================================="));
+            self.trace("=================================");
         } else if self.verbosity >= VerbosityLevel::Debug {
-            self.debug(&format!("API Query: {} {}", method, url));
+            self.debug(&format!("API Query: {method} {url}"));
             if let Some(headers) = headers {
-                self.debug(&format!("Headers: {}", headers));
+                self.debug(&format!("Headers: {headers}"));
             }
             if let Some(body) = body {
                 let truncated_body = if body.len() > 200 {
@@ -159,7 +160,7 @@ impl DebugLogger {
                 } else {
                     body.to_string()
                 };
-                self.debug(&format!("Body: {}", truncated_body));
+                self.debug(&format!("Body: {truncated_body}"));
             }
         }
     }
@@ -167,12 +168,12 @@ impl DebugLogger {
     /// Log API response details
     pub fn log_response(&self, status: u16, headers: Option<&str>, body: Option<&str>) {
         if self.verbosity >= VerbosityLevel::Debug {
-            self.debug(&format!("API Response: Status {}", status));
-            
+            self.debug(&format!("API Response: Status {status}"));
+
             if let Some(headers) = headers {
-                self.trace(&format!("Response Headers: {}", headers));
+                self.trace(&format!("Response Headers: {headers}"));
             }
-            
+
             if let Some(body) = body {
                 // Truncate body for security
                 let truncated_body = if body.len() > 500 {
@@ -180,7 +181,7 @@ impl DebugLogger {
                 } else {
                     body.to_string()
                 };
-                self.trace(&format!("Response Body: {}", truncated_body));
+                self.trace(&format!("Response Body: {truncated_body}"));
             }
         }
     }
@@ -188,7 +189,7 @@ impl DebugLogger {
     /// Log configuration details
     pub fn log_config(&self, config_name: &str, config_value: &str) {
         if self.verbosity >= VerbosityLevel::Info {
-            self.info(&format!("Config {}: {}", config_name, config_value));
+            self.info(&format!("Config {config_name}: {config_value}"));
         }
     }
 
@@ -197,9 +198,9 @@ impl DebugLogger {
         if self.verbosity >= VerbosityLevel::Debug {
             let status = if result { "PASS" } else { "FAIL" };
             let message = if let Some(details) = details {
-                format!("Validation {}: {} - {}", validation_name, status, details)
+                format!("Validation {validation_name}: {status} - {details}")
             } else {
-                format!("Validation {}: {}", validation_name, status)
+                format!("Validation {validation_name}: {status}")
             };
             self.debug(&message);
         }
@@ -208,7 +209,7 @@ impl DebugLogger {
     /// Log timing information
     pub fn log_timing(&self, operation: &str, duration_ms: u64) {
         if self.verbosity >= VerbosityLevel::Debug {
-            self.debug(&format!("Timing {}: {}ms", operation, duration_ms));
+            self.debug(&format!("Timing {operation}: {duration_ms}ms"));
         }
     }
 
@@ -217,11 +218,11 @@ impl DebugLogger {
         if self.verbosity >= VerbosityLevel::Warning {
             let status = if result { "PASS" } else { "FAIL" };
             let message = if let Some(details) = details {
-                format!("Security {}: {} - {}", security_check, status, details)
+                format!("Security {security_check}: {status} - {details}")
             } else {
-                format!("Security {}: {}", security_check, status)
+                format!("Security {security_check}: {status}")
             };
-            
+
             if result {
                 self.debug(&message);
             } else {
@@ -270,4 +271,4 @@ mod tests {
         assert_eq!(VerbosityLevel::from(3), VerbosityLevel::Info);
         assert_eq!(VerbosityLevel::from(10), VerbosityLevel::Trace);
     }
-} 
+}

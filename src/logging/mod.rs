@@ -5,7 +5,44 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::Level;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+// Global log level state
+static CURRENT_LOG_LEVEL: AtomicU8 = AtomicU8::new(2); // Default to INFO (2)
+
+// Log level constants
+const LEVEL_TRACE: u8 = 0;
+const LEVEL_DEBUG: u8 = 1;
+const LEVEL_INFO: u8 = 2;
+const LEVEL_WARN: u8 = 3;
+const LEVEL_ERROR: u8 = 4;
+
+/// Get the current log level
+pub fn get_current_log_level() -> Level {
+    let level = CURRENT_LOG_LEVEL.load(Ordering::Relaxed);
+    match level {
+        LEVEL_TRACE => Level::TRACE,
+        LEVEL_DEBUG => Level::DEBUG,
+        LEVEL_INFO => Level::INFO,
+        LEVEL_WARN => Level::WARN,
+        LEVEL_ERROR => Level::ERROR,
+        _ => Level::INFO, // Default fallback
+    }
+}
+
+/// Set the current log level
+pub fn set_current_log_level(level: Level) {
+    let level_u8 = match level {
+        Level::TRACE => LEVEL_TRACE,
+        Level::DEBUG => LEVEL_DEBUG,
+        Level::INFO => LEVEL_INFO,
+        Level::WARN => LEVEL_WARN,
+        Level::ERROR => LEVEL_ERROR,
+    };
+    CURRENT_LOG_LEVEL.store(level_u8, Ordering::Relaxed);
+}
 
 /// Logging configuration
 #[allow(clippy::struct_excessive_bools)]
@@ -124,6 +161,9 @@ impl LogConfig {
 ///
 /// Returns an error if logging initialization fails.
 pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize the global log level state
+    set_current_log_level(config.level);
+
     // Create logs directory if it doesn't exist
     if config.file
         && let Some(parent) = config.file_path.parent()
@@ -133,13 +173,16 @@ pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error>
 
     // Build the subscriber with proper filter configuration
     let filter = if config.level == Level::TRACE {
-        tracing_subscriber::EnvFilter::new("trace,tidb_cloud=trace")
+        EnvFilter::new("trace,tidb_cloud=trace")
     } else {
-        tracing_subscriber::EnvFilter::new(format!("{}", config.level))
-            .add_directive("tidb_cloud=debug".parse().unwrap_or_else(|_| "tidb_cloud=info".parse().unwrap()))
+        EnvFilter::new(format!("{}", config.level)).add_directive(
+            "tidb_cloud=debug"
+                .parse()
+                .unwrap_or_else(|_| "tidb_cloud=info".parse().unwrap()),
+        )
     };
-    
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+
+    let subscriber = FmtSubscriber::builder()
         .with_level(true)
         .with_target(true)
         .with_file(true)
@@ -153,7 +196,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), Box<dyn std::error::Error>
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Log initialization
-    tracing::info!("Logging system initialized");
+    tracing::debug!("Logging system initialized");
     tracing::debug!("Log config: {:?}", config);
 
     Ok(())
@@ -198,18 +241,69 @@ pub fn init_logging_from_env() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&config)
 }
 
+/// Change the log level dynamically
+///
+/// # Errors
+///
+/// Returns an error if the log level change fails.
+pub fn change_log_level(level: Level) -> Result<(), Box<dyn std::error::Error>> {
+    // Update the global log level state
+    set_current_log_level(level);
+
+    // For now, we'll use a simple approach that doesn't try to change the global dispatcher
+    // The global state is updated, and we can use custom logging functions that respect this state
+
+    // Log the change using a custom function that respects our global state
+    log_with_global_level(Level::DEBUG, &format!("Log level changed to: {level}"));
+
+    // Note: This is a simplified implementation that updates the global state
+    // but doesn't affect the existing tracing subscriber. For a full implementation,
+    // we would need to use tracing_subscriber::reload or implement a custom layer.
+    // The current approach at least prevents the "global dispatcher already set" error.
+
+    Ok(())
+}
+
+/// Custom logging function that respects the global log level state
+pub fn log_with_global_level(level: Level, message: &str) {
+    let current_level = get_current_log_level();
+    if level <= current_level {
+        match level {
+            Level::TRACE => eprintln!("[TRACE] {message}"),
+            Level::DEBUG => eprintln!("[DEBUG] {message}"),
+            Level::INFO => eprintln!("[INFO] {message}"),
+            Level::WARN => eprintln!("[WARN] {message}"),
+            Level::ERROR => eprintln!("[ERROR] {message}"),
+        }
+    }
+}
+
+/// Custom logging function that respects the global log level
+pub fn log_with_level(level: Level, message: &str) {
+    let current_level = get_current_log_level();
+    if level <= current_level {
+        match level {
+            Level::TRACE => tracing::trace!("{}", message),
+            Level::DEBUG => tracing::debug!("{}", message),
+            Level::INFO => tracing::info!("{}", message),
+            Level::WARN => tracing::warn!("{}", message),
+            Level::ERROR => tracing::error!("{}", message),
+        }
+    }
+}
+
 /// Logging macros for common operations
 #[macro_export]
 macro_rules! log_connection_attempt {
     ($host:expr, $user:expr) => {
-        tracing::info!("Attempting connection to {} as user {}", $host, $user);
+        tracing::debug!("Attempting connection to {} as user {}", $host, $user);
     };
 }
 
 #[macro_export]
 macro_rules! log_connection_success {
     ($host:expr) => {
-        tracing::info!("Successfully connected to {}", $host);
+        tracing::debug!("Successfully connected to {}", $host);
     };
 }
 
@@ -237,14 +331,14 @@ macro_rules! log_query_result {
 #[macro_export]
 macro_rules! log_state_transition {
     ($from:expr, $to:expr) => {
-        tracing::info!("State transition: {} -> {}", $from, $to);
+        tracing::debug!("State transition: {} -> {}", $from, $to);
     };
 }
 
 #[macro_export]
 macro_rules! log_import_job {
     ($job_id:expr, $status:expr) => {
-        tracing::info!("Import job {}: {}", $job_id, $status);
+        tracing::debug!("Import job {}: {}", $job_id, $status);
     };
 }
 
@@ -275,7 +369,7 @@ impl ErrorContext {
 
 /// Log performance metrics
 pub fn log_performance_metric(operation: &str, duration: std::time::Duration) {
-    tracing::info!(
+    tracing::debug!(
         operation = %operation,
         duration_ms = duration.as_millis(),
         "Performance metric"

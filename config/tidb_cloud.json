@@ -1,0 +1,20 @@
+{
+  "api": {
+    "base_url": "https://cloud.tidbapi.com",
+    "version": "v1beta2"
+  },
+  "client": {
+    "timeout_secs": 30,
+    "user_agent": "tidb-cloud-cli/0.1.0"
+  },
+  "security": {
+    "min_api_key_length": 32,
+    "max_api_key_length": 256
+  },
+  "debug": {
+    "verbosity_level": 0,
+    "enable_request_logging": false,
+    "enable_api_logging": false,
+    "enable_security_logging": false
+  }
+} 

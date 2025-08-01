@@ -1,9 +1,9 @@
 use crate::tidb_cloud::{
-    error::{TiDBCloudError, TiDBCloudResult},
-    http_utils::{HttpMethods, HttpRequestBuilder},
+    API_BASE_URL, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT,
     config::TiDBCloudConfig,
     debug_logger::DebugLogger,
-    API_BASE_URL, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT,
+    error::{TiDBCloudError, TiDBCloudResult},
+    http_utils::{HttpMethods, HttpRequestBuilder},
 };
 use reqwest::Client;
 use std::time::Duration;
@@ -19,12 +19,23 @@ pub struct TiDBCloudClient {
 impl TiDBCloudClient {
     /// Create a new TiDB Cloud client
     pub fn new(api_key: String) -> TiDBCloudResult<Self> {
-        Self::with_config(api_key, API_BASE_URL.to_string(), DEFAULT_TIMEOUT, DebugLogger::default())
+        Self::with_config(
+            api_key,
+            API_BASE_URL.to_string(),
+            DEFAULT_TIMEOUT,
+            DebugLogger::default(),
+        )
     }
 
     /// Create a new TiDB Cloud client with username and password
     pub fn with_credentials(username: String, password: String) -> TiDBCloudResult<Self> {
-        Self::with_config_and_credentials(username, password, API_BASE_URL.to_string(), DEFAULT_TIMEOUT, DebugLogger::default())
+        Self::with_config_and_credentials(
+            username,
+            password,
+            API_BASE_URL.to_string(),
+            DEFAULT_TIMEOUT,
+            DebugLogger::default(),
+        )
     }
 
     /// Create a new TiDB Cloud client from configuration
@@ -33,7 +44,7 @@ impl TiDBCloudClient {
         let base_url = config.get_api_url();
         let timeout = Duration::from_secs(config.client.timeout_secs);
         let debug_logger = config.get_debug_logger();
-        
+
         Self::with_config(api_key, base_url, timeout, debug_logger)
     }
 
@@ -45,18 +56,20 @@ impl TiDBCloudClient {
         debug_logger: DebugLogger,
     ) -> TiDBCloudResult<Self> {
         if api_key.trim().is_empty() {
-            return Err(TiDBCloudError::ConfigError("API key cannot be empty".to_string()));
+            return Err(TiDBCloudError::ConfigError(
+                "API key cannot be empty".to_string(),
+            ));
         }
 
-        debug_logger.info(&format!("Creating TiDB Cloud client with base URL: {}", base_url));
+        debug_logger.debug(&format!(
+            "Creating TiDB Cloud client with base URL: {base_url}"
+        ));
         debug_logger.debug(&format!("API key length: {} characters", api_key.len()));
 
         // Create HTTP request builder with security validations
-        let builder = HttpRequestBuilder::new(
-            base_url.clone(),
-            timeout,
-            DEFAULT_USER_AGENT.to_string(),
-        ).with_debug_logger(debug_logger.clone());
+        let builder =
+            HttpRequestBuilder::new(base_url.clone(), timeout, DEFAULT_USER_AGENT.to_string())
+                .with_debug_logger(debug_logger.clone());
 
         // Create headers with security validations
         let headers = builder.create_headers(&api_key)?;
@@ -68,11 +81,11 @@ impl TiDBCloudClient {
             .default_headers(headers)
             .build()
             .map_err(|e| {
-                debug_logger.error(&format!("Failed to create HTTP client: {}", e));
-                TiDBCloudError::ConfigError(format!("Failed to create HTTP client: {}", e))
+                debug_logger.error(&format!("Failed to create HTTP client: {e}"));
+                TiDBCloudError::ConfigError(format!("Failed to create HTTP client: {e}"))
             })?;
 
-        debug_logger.info("HTTP client created successfully");
+        debug_logger.debug("HTTP client created successfully");
 
         // Create HTTP methods wrapper
         let http_methods = HttpMethods::new(builder, client, api_key.clone());
@@ -94,18 +107,20 @@ impl TiDBCloudClient {
         debug_logger: DebugLogger,
     ) -> TiDBCloudResult<Self> {
         if password.trim().is_empty() {
-            return Err(TiDBCloudError::ConfigError("Password cannot be empty".to_string()));
+            return Err(TiDBCloudError::ConfigError(
+                "Password cannot be empty".to_string(),
+            ));
         }
 
-        debug_logger.info(&format!("Creating TiDB Cloud client with username '{}' and base URL: {}", username, base_url));
+        debug_logger.debug(&format!(
+            "Creating TiDB Cloud client with username '{username}' and base URL: {base_url}"
+        ));
         debug_logger.debug(&format!("Password length: {} characters", password.len()));
 
         // Create HTTP request builder with security validations
-        let builder = HttpRequestBuilder::new(
-            base_url.clone(),
-            timeout,
-            DEFAULT_USER_AGENT.to_string(),
-        ).with_debug_logger(debug_logger.clone());
+        let builder =
+            HttpRequestBuilder::new(base_url.clone(), timeout, DEFAULT_USER_AGENT.to_string())
+                .with_debug_logger(debug_logger.clone());
 
         // Create headers for digest authentication (no API key validation)
         let headers = builder.create_digest_headers(&password)?;
@@ -117,14 +132,15 @@ impl TiDBCloudClient {
             .default_headers(headers)
             .build()
             .map_err(|e| {
-                debug_logger.error(&format!("Failed to create HTTP client: {}", e));
-                TiDBCloudError::ConfigError(format!("Failed to create HTTP client: {}", e))
+                debug_logger.error(&format!("Failed to create HTTP client: {e}"));
+                TiDBCloudError::ConfigError(format!("Failed to create HTTP client: {e}"))
             })?;
 
-        debug_logger.info("HTTP client created successfully");
+        debug_logger.debug("HTTP client created successfully");
 
         // Create HTTP methods wrapper with username and password
-        let http_methods = HttpMethods::new_with_credentials(builder, client, username, password.clone());
+        let http_methods =
+            HttpMethods::new_with_credentials(builder, client, username, password.clone());
 
         Ok(Self {
             http_methods,
@@ -150,7 +166,7 @@ impl TiDBCloudClient {
     }
 
     /// Make a GET request with security validations
-    pub(crate) async fn get<T>(&self, path: &str, query: Option<&str>) -> TiDBCloudResult<T>
+    pub(crate) async fn get<T>(&mut self, path: &str, query: Option<&str>) -> TiDBCloudResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
     {
@@ -158,7 +174,7 @@ impl TiDBCloudClient {
     }
 
     /// Make a POST request with security validations
-    pub(crate) async fn post<T, B>(&self, path: &str, body: Option<&B>) -> TiDBCloudResult<T>
+    pub(crate) async fn post<T, B>(&mut self, path: &str, body: Option<&B>) -> TiDBCloudResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
         B: serde::Serialize,
@@ -167,7 +183,7 @@ impl TiDBCloudClient {
     }
 
     /// Make a PATCH request with security validations
-    pub(crate) async fn patch<T, B>(&self, path: &str, body: &B) -> TiDBCloudResult<T>
+    pub(crate) async fn patch<T, B>(&mut self, path: &str, body: &B) -> TiDBCloudResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
         B: serde::Serialize,
@@ -176,7 +192,7 @@ impl TiDBCloudClient {
     }
 
     /// Make a DELETE request with security validations
-    pub(crate) async fn delete<T>(&self, path: &str, query: Option<&str>) -> TiDBCloudResult<T>
+    pub(crate) async fn delete<T>(&mut self, path: &str, query: Option<&str>) -> TiDBCloudResult<T>
     where
         T: for<'de> serde::Deserialize<'de>,
     {
@@ -184,7 +200,10 @@ impl TiDBCloudClient {
     }
 
     /// Build query string from parameters with security validations
-    pub(crate) fn build_query_string(&self, params: &impl serde::Serialize) -> TiDBCloudResult<String> {
+    pub(crate) fn build_query_string(
+        &self,
+        params: &impl serde::Serialize,
+    ) -> TiDBCloudResult<String> {
         // Use the HTTP request builder to sanitize query parameters
         let builder = HttpRequestBuilder::new(
             self.base_url.clone(),
@@ -210,7 +229,8 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string());
+        let client =
+            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string());
         assert!(client.is_ok());
     }
 
@@ -226,9 +246,11 @@ mod tests {
 
     #[test]
     fn test_client_debug() {
-        let client = TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string()).unwrap();
+        let client =
+            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string())
+                .unwrap();
         let debug_str = format!("{:?}", client);
         assert!(debug_str.contains("TiDBCloudClient"));
         assert!(debug_str.contains("***")); // API key should be masked
     }
-} 
+}

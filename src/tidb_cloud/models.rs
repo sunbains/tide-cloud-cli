@@ -134,30 +134,26 @@ pub enum ComponentType {
 
 /// TiDB cluster information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Tidb {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(rename = "tidbId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tidb_id: Option<String>,
-    #[serde(rename = "displayName")]
     pub display_name: String,
-    #[serde(rename = "regionId")]
     pub region_id: String,
-    #[serde(rename = "cloudProvider", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_provider: Option<CloudProvider>,
-    #[serde(rename = "regionDisplayName", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region_display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<ClusterState>,
-    #[serde(rename = "rootPassword", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_password: Option<String>,
-    #[serde(rename = "minRcu")]
     pub min_rcu: String,
-    #[serde(rename = "maxRcu")]
     pub max_rcu: String,
-    #[serde(rename = "servicePlan")]
     pub service_plan: ServicePlan,
-    #[serde(rename = "highAvailabilityType", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub high_availability_type: Option<HighAvailabilityType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
@@ -165,9 +161,9 @@ pub struct Tidb {
     pub labels: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creator: Option<String>,
-    #[serde(rename = "createTime", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub create_time: Option<String>,
-    #[serde(rename = "updateTime", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub update_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<TidbEndpoint>>,
@@ -200,6 +196,7 @@ impl Default for Tidb {
 
 /// TiDB endpoint information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TidbEndpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -211,6 +208,7 @@ pub struct TidbEndpoint {
 
 /// Backup information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Backup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -244,6 +242,7 @@ pub struct Backup {
 
 /// Backup setting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupSetting {
     pub tidb_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +261,7 @@ pub struct BackupSetting {
 
 /// Backup schedule configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupSchedule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily_schedule: Option<DailySchedule>,
@@ -269,12 +269,14 @@ pub struct BackupSchedule {
 
 /// Daily backup schedule
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DailySchedule {
     pub schedule_time: String, // Format: "hour:minute" like "16:40"
 }
 
 /// Cloud provider information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloudProviderInfo {
     pub tidb_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +289,7 @@ pub struct CloudProviderInfo {
 
 /// Component cost for price estimation
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ComponentCost {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component_type: Option<ComponentType>,
@@ -308,6 +311,7 @@ pub struct ComponentCost {
 
 /// List TiDB clusters response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTidbsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tidbs: Option<Vec<Tidb>>,
@@ -319,6 +323,7 @@ pub struct ListTidbsResponse {
 
 /// List backups response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTidbBackupsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backups: Option<Vec<Backup>>,
@@ -330,6 +335,7 @@ pub struct ListTidbBackupsResponse {
 
 /// Price estimation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EstimatePriceRequest {
     pub region_id: String,
     pub min_rcu: String,
@@ -341,6 +347,7 @@ pub struct EstimatePriceRequest {
 
 /// Price estimation response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EstimatePriceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub costs: Option<Vec<ComponentCost>>,
@@ -348,6 +355,7 @@ pub struct EstimatePriceResponse {
 
 /// Restore TiDB request
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreTidbRequest {
     pub tidb: Tidb,
     pub source_tidb_id: String,
@@ -362,6 +370,7 @@ pub struct RestoreTidbRequest {
 
 /// Restore TiDB response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreTidbResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tidb: Option<Tidb>,
@@ -369,6 +378,7 @@ pub struct RestoreTidbResponse {
 
 /// Restore status response
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RestoreStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<RestoreState>,
@@ -380,6 +390,7 @@ pub struct RestoreStatusResponse {
 
 /// Reset root password request body
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResetRootPasswordBody {
     pub root_password: String,
 }
@@ -394,16 +405,17 @@ pub struct ResetRootPasswordResponse {}
 
 /// Query parameters for listing TiDB clusters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTidbsParams {
-    #[serde(rename = "servicePlan", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_plan: Option<ServicePlan>,
-    #[serde(rename = "regionIds", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region_ids: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(rename = "pageSize", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub page_size: Option<i32>,
-    #[serde(rename = "pageToken", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub page_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip: Option<i32>,
@@ -411,20 +423,21 @@ pub struct ListTidbsParams {
 
 /// Query parameters for listing backups
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ListBackupsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Vec<BackupState>>,
-    #[serde(rename = "regionId", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region_id: Option<Vec<String>>,
-    #[serde(rename = "triggerType", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_type: Option<Vec<BackupTriggerType>>,
-    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_time: Option<String>,
-    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_time: Option<String>,
-    #[serde(rename = "pageSize", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub page_size: Option<i32>,
-    #[serde(rename = "pageToken", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub page_token: Option<String>,
 }
 
@@ -434,6 +447,7 @@ pub struct ListBackupsParams {
 
 /// Update TiDB request body
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateTidbRequest {
     pub display_name: String,
     pub min_rcu: String,
@@ -442,6 +456,7 @@ pub struct UpdateTidbRequest {
 
 /// Update backup setting request body
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateBackupSettingRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_type: Option<BackupScheduleType>,
@@ -455,4 +470,30 @@ pub struct UpdateBackupSettingRequest {
     pub pitr_start_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pitr_end_time: Option<String>,
-} 
+}
+
+/// IP access list entry for public connection settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpAccessListEntry {
+    pub cidr_notation: String,
+    pub description: String,
+}
+
+/// Request body for updating public connection settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePublicConnectionRequest {
+    pub enabled: bool,
+    pub ip_access_list: Vec<IpAccessListEntry>,
+}
+
+/// Response for public connection settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicConnectionResponse {
+    pub name: String,
+    pub tidb_id: String,
+    pub enabled: bool,
+    pub ip_access_list: Vec<IpAccessListEntry>,
+}
