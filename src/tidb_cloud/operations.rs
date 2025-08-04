@@ -90,10 +90,8 @@ impl TiDBCloudClient {
         tidb_id: &str,
         password: &str,
     ) -> TiDBCloudResult<ResetRootPasswordResponse> {
-        let path = PathBuilder::new()
-            .tidb_id(tidb_id)
-            .reset_root_password()
-            .build();
+        // Use mixed format: /tidbs/{tidb_id}:resetRootPassword
+        let path = format!("/tidbs/{tidb_id}:resetRootPassword");
         let body = ResetRootPasswordBody {
             root_password: password.to_string(),
         };
@@ -391,11 +389,8 @@ mod tests {
     #[test]
     fn test_reset_root_password_url_format() {
         let tidb_id = "12345";
-        let expected_path = "/tidbs/12345/resetRootPassword";
-        let actual_path = PathBuilder::new()
-            .tidb_id(tidb_id)
-            .reset_root_password()
-            .build();
+        let expected_path = "/tidbs/12345:resetRootPassword";
+        let actual_path = format!("/tidbs/{tidb_id}:resetRootPassword");
         assert_eq!(actual_path, expected_path);
     }
 

@@ -548,9 +548,27 @@ impl DSLExecutor {
             && let Some(password_str) = root_password.as_string()
         {
             // Reset root password using the dedicated endpoint
+            // Try using internal_name if available, otherwise use tidb_id
+            let api_cluster_id = if let Some(internal_name) = &cluster.name {
+                // Extract the ID from internal_name (e.g., "clusters/10103009492238500237" -> "10103009492238500237")
+                if internal_name.starts_with("clusters/") {
+                    internal_name.trim_start_matches("clusters/")
+                } else {
+                    internal_name
+                }
+            } else {
+                cluster_id
+            };
+
+            tracing::debug!(
+                "Attempting to reset root password for cluster '{}' with ID '{}' (API ID: '{}')",
+                name,
+                cluster_id,
+                api_cluster_id
+            );
             match self
                 .client
-                .reset_root_password(cluster_id, password_str)
+                .reset_root_password(api_cluster_id, password_str)
                 .await
             {
                 Ok(_) => {
@@ -1165,6 +1183,8 @@ impl DSLExecutor {
 
     fn cluster_to_dsl_value(&self, cluster: Tidb) -> DSLValue {
         let mut obj = HashMap::new();
+
+        // Basic fields
         obj.insert(
             "id".to_string(),
             DSLValue::from(cluster.tidb_id.unwrap_or_default()),
@@ -1185,6 +1205,65 @@ impl DSLExecutor {
             DSLValue::from(format!("{:?}", cluster.service_plan)),
         );
 
+        // Additional fields from the full Tidb struct
+        if let Some(name) = cluster.name {
+            obj.insert("internal_name".to_string(), DSLValue::from(name));
+        }
+
+        if let Some(cloud_provider) = cluster.cloud_provider {
+            obj.insert(
+                "cloud_provider".to_string(),
+                DSLValue::from(format!("{cloud_provider:?}")),
+            );
+        }
+
+        if let Some(region_display_name) = cluster.region_display_name {
+            obj.insert(
+                "region_display_name".to_string(),
+                DSLValue::from(region_display_name),
+            );
+        }
+
+        if let Some(root_password) = cluster.root_password {
+            obj.insert("root_password".to_string(), DSLValue::from(root_password));
+        }
+
+        if let Some(high_availability_type) = cluster.high_availability_type {
+            obj.insert(
+                "high_availability_type".to_string(),
+                DSLValue::from(format!("{high_availability_type:?}")),
+            );
+        }
+
+        if let Some(annotations) = cluster.annotations {
+            let annotations_obj = annotations
+                .into_iter()
+                .map(|(k, v)| (k, DSLValue::from(v)))
+                .collect();
+            obj.insert("annotations".to_string(), DSLValue::Object(annotations_obj));
+        }
+
+        if let Some(labels) = cluster.labels {
+            let labels_obj = labels
+                .into_iter()
+                .map(|(k, v)| (k, DSLValue::from(v)))
+                .collect();
+            obj.insert("labels".to_string(), DSLValue::Object(labels_obj));
+        }
+
+        if let Some(creator) = cluster.creator {
+            obj.insert("creator".to_string(), DSLValue::from(creator));
+        }
+
+        if let Some(create_time) = cluster.create_time {
+            obj.insert("create_time".to_string(), DSLValue::from(create_time));
+        }
+
+        if let Some(update_time) = cluster.update_time {
+            obj.insert("update_time".to_string(), DSLValue::from(update_time));
+        }
+
+        // Endpoints with full information
         if let Some(endpoints) = cluster.endpoints {
             let endpoints_array = endpoints
                 .into_iter()
@@ -1198,6 +1277,12 @@ impl DSLExecutor {
                         "port".to_string(),
                         DSLValue::from(e.port.unwrap_or(0) as f64),
                     );
+                    if let Some(connection_type) = e.connection_type {
+                        endpoint_obj.insert(
+                            "connection_type".to_string(),
+                            DSLValue::from(format!("{connection_type:?}")),
+                        );
+                    }
                     DSLValue::Object(endpoint_obj)
                 })
                 .collect();

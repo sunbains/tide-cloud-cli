@@ -72,7 +72,7 @@ impl SQLDSLParser {
 
     /// Transform SELECT command
     /// SELECT * FROM CLUSTER [name] [WHERE condition] -> LIST CLUSTERS [WHERE condition]
-    /// SELECT field1, field2 FROM CLUSTER [name] [WHERE condition] -> LIST CLUSTERS [WHERE condition]
+    /// SELECT field1, field2 FROM CLUSTER [name] [WHERE condition] -> LIST CLUSTERS [WHERE condition] or GET CLUSTER [name]
     fn transform_select(input: &str) -> DSLResult<String> {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
@@ -98,13 +98,29 @@ impl SQLDSLParser {
             })
             .ok_or_else(|| DSLError::syntax_error(0, "Expected FROM CLUSTER"))?;
 
-        let mut result = "LIST CLUSTERS".to_string();
+        // Check if there's a specific cluster name after FROM CLUSTER
+        let has_cluster_name = from_cluster_pos + 2 < parts.len()
+            && !["WHERE", "INTO"].contains(&parts[from_cluster_pos + 2].to_uppercase().as_str());
 
-        // Add WHERE clause if present (after FROM CLUSTER)
-        if let Some(where_index) = parts[from_cluster_pos..]
+        let mut result = if has_cluster_name {
+            // SELECT * FROM CLUSTER <name> -> GET CLUSTER <name>
+            let cluster_name = parts[from_cluster_pos + 2];
+            format!("GET CLUSTER {cluster_name}")
+        } else {
+            // SELECT * FROM CLUSTER -> LIST CLUSTERS
+            "LIST CLUSTERS".to_string()
+        };
+
+        // Add WHERE clause if present (after FROM CLUSTER or cluster name)
+        let where_start_pos = if has_cluster_name {
+            from_cluster_pos + 3
+        } else {
+            from_cluster_pos + 2
+        };
+        if let Some(where_index) = parts[where_start_pos..]
             .iter()
             .position(|&p| p.to_uppercase() == "WHERE")
-            .map(|pos| from_cluster_pos + pos)
+            .map(|pos| where_start_pos + pos)
         {
             let where_clause = parts[where_index..].join(" ");
             result.push_str(&format!(" {where_clause}"));
@@ -257,6 +273,34 @@ mod tests {
             result.unwrap(),
             "LIST CLUSTERS WHERE state = 'active' INTO cluster_name"
         );
+    }
+
+    #[test]
+    fn test_transform_select_specific_cluster() {
+        let result = SQLDSLParser::transform_select("SELECT * FROM CLUSTER my-cluster");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "GET CLUSTER my-cluster");
+    }
+
+    #[test]
+    fn test_transform_select_specific_cluster_with_where() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT * FROM CLUSTER my-cluster WHERE state = 'active'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "GET CLUSTER my-cluster WHERE state = 'active'"
+        );
+    }
+
+    #[test]
+    fn test_transform_select_specific_cluster_with_into() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT display_name INTO cluster_name FROM CLUSTER my-cluster",
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "GET CLUSTER my-cluster INTO cluster_name");
     }
 
     #[test]

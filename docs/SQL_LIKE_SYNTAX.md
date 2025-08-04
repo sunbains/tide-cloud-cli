@@ -100,8 +100,10 @@ SELECT * FROM CLUSTER WHERE name = test* AND (state = ACTIVE OR state = CREATING
 **Syntax:**
 ```sql
 SELECT * FROM CLUSTER [WHERE condition]
+SELECT * FROM CLUSTER <name> [WHERE condition]
 SELECT field1, field2 FROM CLUSTER [WHERE condition]
 SELECT field1, field2 INTO var1, var2 FROM CLUSTER [WHERE condition]
+SELECT * FROM CLUSTER <name> INTO var FROM CLUSTER <name>
 ```
 
 **Examples:**
@@ -109,12 +111,18 @@ SELECT field1, field2 INTO var1, var2 FROM CLUSTER [WHERE condition]
 -- List all clusters
 SELECT * FROM CLUSTER
 
+-- Get specific cluster with full details
+SELECT * FROM CLUSTER my-cluster
+
 -- List clusters with specific fields
 SELECT name, region, state FROM CLUSTER
 
 -- List clusters with simple filter
 SELECT * FROM CLUSTER WHERE state = 'active'
 SELECT * FROM CLUSTER WHERE region = 'aws-us-west-1' AND state = 'active'
+
+-- Get specific cluster with condition
+SELECT * FROM CLUSTER my-cluster WHERE state = 'active'
 
 -- Complex filtering with RPN evaluation
 SELECT * FROM CLUSTER WHERE (name = test* OR name = prod*) AND (state = ACTIVE OR state = CREATING)
@@ -124,31 +132,40 @@ SELECT * FROM CLUSTER WHERE state IN ['ACTIVE', 'CREATING'] AND region IN ['us-w
 -- Store cluster data in variables
 SELECT display_name INTO cluster_name FROM CLUSTER WHERE state = 'active'
 SELECT display_name, region INTO cluster_name, cluster_region FROM CLUSTER
+
+-- Store specific cluster data in variable
+SELECT * FROM CLUSTER my-cluster INTO cluster_data
 ```
 
 **Transforms to:**
 ```dsl
 LIST CLUSTERS
+GET CLUSTER my-cluster
 LIST CLUSTERS WHERE state = 'active'
 LIST CLUSTERS WHERE (name = test* OR name = prod*) AND (state = ACTIVE OR state = CREATING)
 LIST CLUSTERS WHERE state = 'active' INTO cluster_name
 LIST CLUSTERS INTO cluster_name, cluster_region
+GET CLUSTER my-cluster INTO cluster_data
 ```
 
 **Features:**
-- ✅ **Advanced filtering**: Complex boolean expressions with proper operator precedence
+- ✅ **Filtering**: Complex boolean expressions with proper operator precedence
 - ✅ **Pattern matching**: Wildcard and regex support
 - ✅ **IN operator**: Check if values are in a list of options
 - ✅ **Variable assignment**: Store cluster data in variables for later use
 - ✅ **Multiple variables**: Assign multiple fields to multiple variables
 - ✅ **Combined with WHERE**: Filter clusters and store results in variables
 - ✅ **Flexible syntax**: Works with any number of field-variable pairs
+- ✅ **Specific cluster selection**: Get detailed information about a specific cluster
 
 **Notes:**
 - The `INTO` clause stores the first matching cluster's data in the specified variables
 - Variables can be used in subsequent commands using `$variable_name` syntax
 - If no clusters match the WHERE condition, variables remain unchanged
-- Complex WHERE clauses are evaluated using the RPN-based condition evaluator
+- WHERE clauses are evaluated using the RPN-based condition evaluator
+- `SELECT * FROM CLUSTER <name>` provides complete cluster details including all available fields
+- When selecting a specific cluster, all JSON data from the server response is included
+- This includes security fields, metadata, configuration, and network information
 
 ### CREATE Commands
 
