@@ -8,9 +8,9 @@ use crate::tidb_cloud::{TiDBCloudClient, models::*};
 use colored::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 use tracing::Level;
 
 /// DSL executor that runs commands against the TiDB Cloud API
@@ -20,6 +20,7 @@ pub struct DSLExecutor {
     _timeout: Duration,
     request_count: Arc<AtomicU64>,
     last_request_time: Arc<AtomicU64>,
+    cancellation_flag: Arc<AtomicBool>,
 }
 
 /// RPN-based condition evaluator for complex WHERE clauses
@@ -76,6 +77,7 @@ impl DSLExecutor {
             _timeout: Duration::from_secs(300), // 5 minutes default timeout
             request_count: Arc::new(AtomicU64::new(0)),
             last_request_time: Arc::new(AtomicU64::new(0)),
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -95,6 +97,7 @@ impl DSLExecutor {
             _timeout: timeout,
             request_count: Arc::new(AtomicU64::new(0)),
             last_request_time: Arc::new(AtomicU64::new(0)),
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -113,6 +116,7 @@ impl DSLExecutor {
             _timeout: timeout,
             request_count: Arc::new(AtomicU64::new(0)),
             last_request_time: Arc::new(AtomicU64::new(0)),
+            cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -699,10 +703,17 @@ impl DSLExecutor {
     async fn execute_wait_for_cluster(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
         let name = command.get_parameter_as_string("name")?;
         let state = command.get_parameter_as_string("state")?;
-        let timeout_seconds = command
-            .get_optional_parameter("timeout")
-            .and_then(|v| v.as_number())
-            .unwrap_or(600.0) as u64;
+
+        // Check if timeout is specified
+        let has_timeout = command.get_optional_parameter("timeout").is_some();
+        let timeout_seconds = if has_timeout {
+            command
+                .get_optional_parameter("timeout")
+                .and_then(|v| v.as_number())
+                .unwrap_or(600.0) as u64
+        } else {
+            0 // Will be used to indicate infinite timeout
+        };
 
         let target_state = match state.to_uppercase().as_str() {
             "ACTIVE" => ClusterState::Active,
@@ -735,6 +746,14 @@ impl DSLExecutor {
             .as_ref()
             .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
 
+        // If no timeout is specified, implement infinite wait with periodic messages
+        if !has_timeout {
+            return self
+                .wait_for_cluster_infinite(cluster_id, name, target_state, state)
+                .await;
+        }
+
+        // Use the original timeout-based approach
         match self
             .client
             .wait_for_tidb_state(
@@ -756,6 +775,81 @@ impl DSLExecutor {
                 format!("Failed to wait for cluster '{name}' to reach state '{state}'"),
                 e.to_string(),
             )),
+        }
+    }
+
+    async fn wait_for_cluster_infinite(
+        &mut self,
+        cluster_id: &str,
+        cluster_name: &str,
+        target_state: ClusterState,
+        target_state_str: &str,
+    ) -> DSLResult<CommandResult> {
+        let start_time = std::time::Instant::now();
+        let mut last_message_time = start_time;
+        let message_interval = Duration::from_secs(60); // Print message every minute
+
+        println!(
+            "Waiting for cluster '{cluster_name}' to reach state '{target_state_str}' (no timeout specified)"
+        );
+
+        loop {
+            // Check for cancellation
+            if self.is_cancelled() {
+                println!("Command cancelled by user");
+                return Err(DSLError::execution_error("Command was cancelled by user"));
+            }
+
+            // Check current cluster state
+            let cluster = match self.client.get_tidb(cluster_id).await {
+                Ok(cluster) => cluster,
+                Err(e) => {
+                    return Err(DSLError::execution_error_with_source(
+                        format!("Failed to get cluster '{cluster_name}' status"),
+                        e.to_string(),
+                    ));
+                }
+            };
+
+            // Check if target state is reached
+            if let Some(current_state) = &cluster.state
+                && current_state == &target_state
+            {
+                let cluster_data = self.cluster_to_dsl_value(cluster);
+                let elapsed = start_time.elapsed();
+                let elapsed_str = self.format_duration(elapsed);
+
+                println!(
+                    "Cluster '{cluster_name}' reached state '{target_state_str}' after {elapsed_str}"
+                );
+
+                return Ok(CommandResult::success_with_data_and_message(
+                    cluster_data,
+                    format!(
+                        "Cluster '{cluster_name}' reached state '{target_state_str}' after {elapsed_str}"
+                    ),
+                ));
+            }
+
+            // Print status message every minute
+            let now = std::time::Instant::now();
+            if now.duration_since(last_message_time) >= message_interval {
+                let elapsed = now.duration_since(start_time);
+                let elapsed_str = self.format_duration(elapsed);
+                let current_state_str = cluster
+                    .state
+                    .as_ref()
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                println!(
+                    "Still waiting for cluster '{cluster_name}' to reach state '{target_state_str}' (current: {current_state_str}, elapsed: {elapsed_str})"
+                );
+                last_message_time = now;
+            }
+
+            // Wait before next check
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     }
 
@@ -988,8 +1082,32 @@ impl DSLExecutor {
 
     async fn execute_sleep(&self, command: DSLCommand) -> DSLResult<CommandResult> {
         let seconds = command.get_parameter_as_number("seconds")?;
+        let total_duration = Duration::from_secs_f64(seconds);
+        let start_time = std::time::Instant::now();
 
-        sleep(Duration::from_secs_f64(seconds)).await;
+        // Sleep in smaller intervals to allow for cancellation
+        let check_interval = Duration::from_millis(100); // Check every 100ms
+        let mut elapsed = Duration::ZERO;
+
+        while elapsed < total_duration {
+            // Check for cancellation
+            if self.is_cancelled() {
+                return Err(DSLError::execution_error(
+                    "Sleep command was cancelled by user",
+                ));
+            }
+
+            // Sleep for the shorter of the remaining time or check interval
+            let remaining = total_duration - elapsed;
+            let sleep_duration = if remaining < check_interval {
+                remaining
+            } else {
+                check_interval
+            };
+
+            tokio::time::sleep(sleep_duration).await;
+            elapsed = start_time.elapsed();
+        }
 
         Ok(CommandResult::success_with_message(format!(
             "Slept for {seconds} seconds"
@@ -1227,6 +1345,26 @@ impl DSLExecutor {
     /// Clear all variables
     pub fn clear_variables(&mut self) {
         self.variables.clear();
+    }
+
+    /// Set the cancellation flag to true
+    pub fn cancel(&self) {
+        self.cancellation_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Reset the cancellation flag to false
+    pub fn reset_cancellation(&self) {
+        self.cancellation_flag.store(false, Ordering::Relaxed);
+    }
+
+    /// Check if cancellation has been requested
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_flag.load(Ordering::Relaxed)
+    }
+
+    /// Get a reference to the cancellation flag for sharing
+    pub fn get_cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation_flag)
     }
 
     /// Sanitize output to prevent injection attacks

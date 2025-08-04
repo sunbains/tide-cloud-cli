@@ -5,11 +5,14 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tidb_cli::{
     dsl::{DSLCommand, DSLExecutor, DSLParser, sql_parser::SQLDSLParser},
     logging::{LogConfig, init_logging},
     tidb_cloud::{DebugLogger, TiDBCloudClient, constants::VerbosityLevel},
 };
+use tokio::signal;
 use tracing::Level;
 
 #[derive(Parser)]
@@ -55,9 +58,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute a single DSL command
+    /// Execute one or more DSL commands (separated by semicolons)
     Exec {
-        /// The DSL command to execute
+        /// The DSL command(s) to execute
         command: String,
     },
 
@@ -174,9 +177,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Set up signal handling for Ctrl+C
+    let cancellation_flag = if let Some(ref mut exec) = executor {
+        exec.get_cancellation_flag()
+    } else {
+        Arc::new(AtomicBool::new(false))
+    };
+
+    // Spawn signal handler
+    let signal_flag = Arc::clone(&cancellation_flag);
+    tokio::spawn(async move {
+        if let Ok(()) = signal::ctrl_c().await {
+            println!("\nReceived Ctrl+C, cancelling current command...");
+            signal_flag.store(true, Ordering::Relaxed);
+        }
+    });
+
     match cli.command {
         Commands::Exec { command } => {
-            execute_single_command(executor.as_mut().unwrap(), &command).await?;
+            // Split command by semicolons to handle multiple commands
+            let commands = split_commands(&command);
+            execute_multiple_commands(executor.as_mut().unwrap(), &commands).await?;
         }
 
         Commands::Script { file } => {
@@ -229,6 +250,35 @@ fn parse_command_with_sql_fallback(
         Ok(command) => Ok(command),
         Err(_) => DSLParser::parse(command).map_err(|e| e.into()),
     }
+}
+
+/// Split input into individual commands by semicolon
+fn split_commands(input: &str) -> Vec<String> {
+    input
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+async fn execute_multiple_commands(
+    executor: &mut DSLExecutor,
+    commands: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (i, command) in commands.iter().enumerate() {
+        if commands.len() > 1 {
+            println!(
+                "Executing command {} of {}: {}",
+                i + 1,
+                commands.len(),
+                command
+            );
+        }
+
+        execute_single_command(executor, command).await?;
+    }
+    Ok(())
 }
 
 async fn execute_single_command(
@@ -406,8 +456,18 @@ async fn run_interactive_mode(
                         }
                     }
                     _ => {
-                        if let Err(e) = execute_single_command(executor, input).await {
-                            println!("Error: {e}");
+                        // Reset cancellation flag before executing command
+                        executor.reset_cancellation();
+
+                        // Split input by semicolons to handle multiple commands
+                        let commands = split_commands(input);
+
+                        if let Err(e) = execute_multiple_commands(executor, &commands).await {
+                            if e.to_string().contains("cancelled") {
+                                println!("Command cancelled");
+                            } else {
+                                println!("Error: {e}");
+                            }
                         }
                     }
                 }
@@ -1302,6 +1362,11 @@ fn show_interactive_help() {
     println!("  SET region = \"aws-us-west-1\"");
     println!("  ECHO \"Hello, World!\"");
     println!("  SLEEP 5");
+    println!();
+    println!("Multiple Commands:");
+    println!("  Use semicolons (;) to separate multiple commands:");
+    println!("  ECHO \"Hello\"; SET region = \"us-east-1\"; LIST CLUSTERS");
+    println!("  SLEEP 2; ECHO \"Done\"; WAIT FOR my-cluster TO BE Active");
 }
 
 fn show_variables(executor: &DSLExecutor) {

@@ -320,11 +320,32 @@ WAIT FOR CLUSTER name TO BE state [WITH timeout]
 
 **Examples:**
 ```sql
--- Wait for cluster to be active
+-- Wait for cluster to be active (infinite timeout with status messages)
 WAIT FOR CLUSTER my-cluster TO BE active
 
--- Wait with timeout
+-- Wait with timeout (original behavior)
 WAIT FOR CLUSTER my-cluster TO BE active WITH timeout = 300
+
+-- Wait for cluster to finish creating (infinite timeout)
+WAIT FOR CLUSTER my-cluster TO BE creating
+
+-- Wait for cluster to be deleted (infinite timeout)
+WAIT FOR CLUSTER my-cluster TO BE deleting
+```
+
+**Infinite Timeout Behavior:**
+When no timeout is specified, the command will:
+1. Print an initial message: `"Waiting for cluster 'name' to reach state 'state' (no timeout specified)"`
+2. Print a status message every minute showing current state and elapsed time
+3. Continue until the target state is reached
+4. Print a final success message with total elapsed time
+
+**Example Output:**
+```
+Waiting for cluster 'my-cluster' to reach state 'active' (no timeout specified)
+Still waiting for cluster 'my-cluster' to reach state 'active' (current: Creating, elapsed: 1m 0s)
+Still waiting for cluster 'my-cluster' to reach state 'active' (current: Creating, elapsed: 2m 0s)
+Cluster 'my-cluster' reached state 'active' after 2m 15s
 ```
 
 **Transforms to:**
