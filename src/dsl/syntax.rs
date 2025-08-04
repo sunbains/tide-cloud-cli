@@ -498,7 +498,7 @@ pub struct ClusterUpdate {
 }
 
 /// DSL value types
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum DSLValue {
     String(String),
     Number(f64),

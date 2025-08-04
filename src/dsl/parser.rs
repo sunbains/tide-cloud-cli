@@ -688,6 +688,10 @@ impl DSLParser {
 
         let mut command = DSLCommand::new(DSLCommandType::ListClusters);
 
+        if self.match_token(DSLTokenType::With) {
+            command = self.parse_with_clause(command)?;
+        }
+
         if self.match_token(DSLTokenType::Where) {
             command = self.parse_where_clause(command)?;
         }
@@ -711,10 +715,14 @@ impl DSLParser {
         self.consume(DSLTokenType::Cluster, "Expected 'CLUSTER'")?;
         let name = self.parse_identifier()?;
 
-        Ok(
-            DSLCommand::new(DSLCommandType::GetCluster)
-                .with_parameter("name", DSLValue::from(name)),
-        )
+        let mut command = DSLCommand::new(DSLCommandType::GetCluster)
+            .with_parameter("name", DSLValue::from(name));
+
+        if self.match_token(DSLTokenType::With) {
+            command = self.parse_with_clause(command)?;
+        }
+
+        Ok(command)
     }
 
     fn parse_update_command(&mut self) -> DSLResult<DSLCommand> {

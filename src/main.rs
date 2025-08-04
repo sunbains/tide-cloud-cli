@@ -248,7 +248,20 @@ fn parse_command_with_sql_fallback(
     // Try SQL-like parser first, then fall back to original DSL parser
     match SQLDSLParser::parse(command) {
         Ok(command) => Ok(command),
-        Err(_) => DSLParser::parse(command).map_err(|e| e.into()),
+        Err(sql_error) => {
+            // If the command starts with SQL keywords, return the SQL error
+            let lower_command = command.trim().to_lowercase();
+            if lower_command.starts_with("select")
+                || lower_command.starts_with("create")
+                || lower_command.starts_with("update")
+                || lower_command.starts_with("drop")
+                || lower_command.starts_with("wait")
+            {
+                return Err(sql_error.into());
+            }
+            // Otherwise, try the DSL parser
+            DSLParser::parse(command).map_err(|e| e.into())
+        }
     }
 }
 
@@ -293,6 +306,7 @@ async fn execute_single_command(
     match parse_command_with_sql_fallback(command) {
         Ok(parsed_command) => {
             debug!("Command parsed successfully: {:?}", parsed_command);
+
             match executor.execute(parsed_command).await {
                 Ok(result) => {
                     if result.is_success() {
@@ -303,7 +317,8 @@ async fn execute_single_command(
                         }
                         if let Some(data) = result.get_data() {
                             debug!("Command data: {}", data);
-                            println!("Data: {data}");
+                            let pretty_data = executor.pretty_print_table(data);
+                            println!("Data:\n{pretty_data}");
                         }
                         if let Some(duration) = result.get_metadata("duration_ms")
                             && let Some(duration_ms) = duration.as_number()
@@ -1492,5 +1507,33 @@ fn show_history(rl: &DefaultEditor) {
         println!("No command history");
     } else {
         println!("Total: {count} commands");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_command_with_sql_fallback_invalid_field() {
+        let result = parse_command_with_sql_fallback("select n from cluster");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        let error_str = error.to_string();
+        println!("SQL Error: {}", error_str);
+        assert!(error_str.contains("Invalid field 'n'"));
+        assert!(error_str.contains("Valid fields are:"));
+    }
+
+    #[test]
+    fn test_parse_command_with_sql_fallback_valid_sql() {
+        let result = parse_command_with_sql_fallback("select displayName from cluster");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_command_with_sql_fallback_dsl_command() {
+        let result = parse_command_with_sql_fallback("list clusters");
+        assert!(result.is_ok());
     }
 }

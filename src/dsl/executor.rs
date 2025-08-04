@@ -6,6 +6,7 @@ use crate::dsl::{
 use crate::logging::{change_log_level, set_current_log_level};
 use crate::tidb_cloud::{TiDBCloudClient, models::*};
 use colored::*;
+use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -474,13 +475,35 @@ impl DSLExecutor {
 
                 let display_text = display_lines.join("\n");
 
-                // Also create the original data structure for programmatic access
-                let clusters_data = DSLValue::Array(
-                    clusters
-                        .into_iter()
-                        .map(|c| self.cluster_to_dsl_value(c))
-                        .collect(),
-                );
+                // Check if specific fields were selected
+                let selected_fields = command
+                    .parameters
+                    .get("selected_fields")
+                    .and_then(|v| v.as_string())
+                    .map(|s| {
+                        s.split(',')
+                            .map(|f| f.trim().to_string())
+                            .collect::<Vec<_>>()
+                    });
+
+                // Create the data structure - either full or filtered
+                let clusters_data = if let Some(fields) = selected_fields {
+                    // Filter to only selected fields
+                    DSLValue::Array(
+                        clusters
+                            .iter()
+                            .map(|c| self.cluster_to_dsl_value_filtered(c, &fields))
+                            .collect(),
+                    )
+                } else {
+                    // Full data structure
+                    DSLValue::Array(
+                        clusters
+                            .into_iter()
+                            .map(|c| self.cluster_to_dsl_value(c))
+                            .collect(),
+                    )
+                };
 
                 Ok(CommandResult::success_with_data_and_message(
                     clusters_data,
@@ -513,7 +536,25 @@ impl DSLExecutor {
         let formatted_cluster = self.format_cluster_for_display(&cluster);
         let display_text = format!("Cluster Details:\n  {formatted_cluster}");
 
-        let cluster_data = self.cluster_to_dsl_value(cluster);
+        // Check if specific fields were selected
+        let selected_fields = command
+            .parameters
+            .get("selected_fields")
+            .and_then(|v| v.as_string())
+            .map(|s| {
+                s.split(',')
+                    .map(|f| f.trim().to_string())
+                    .collect::<Vec<_>>()
+            });
+
+        // Create the data structure - either full or filtered
+        let cluster_data = if let Some(fields) = selected_fields {
+            // Filter to only selected fields
+            self.cluster_to_dsl_value_filtered(&cluster, &fields)
+        } else {
+            // Full data structure
+            self.cluster_to_dsl_value(cluster)
+        };
 
         Ok(CommandResult::success_with_data_and_message(
             cluster_data,
@@ -1182,114 +1223,88 @@ impl DSLExecutor {
     }
 
     fn cluster_to_dsl_value(&self, cluster: Tidb) -> DSLValue {
-        let mut obj = HashMap::new();
-
-        // Basic fields
-        obj.insert(
-            "id".to_string(),
-            DSLValue::from(cluster.tidb_id.unwrap_or_default()),
-        );
-        obj.insert("name".to_string(), DSLValue::from(cluster.display_name));
-        obj.insert("region".to_string(), DSLValue::from(cluster.region_id));
-        obj.insert(
-            "state".to_string(),
-            DSLValue::from(format!(
-                "{:?}",
-                cluster.state.unwrap_or(ClusterState::Creating)
-            )),
-        );
-        obj.insert("min_rcu".to_string(), DSLValue::from(cluster.min_rcu));
-        obj.insert("max_rcu".to_string(), DSLValue::from(cluster.max_rcu));
-        obj.insert(
-            "service_plan".to_string(),
-            DSLValue::from(format!("{:?}", cluster.service_plan)),
-        );
-
-        // Additional fields from the full Tidb struct
-        if let Some(name) = cluster.name {
-            obj.insert("internal_name".to_string(), DSLValue::from(name));
+        // Use serde_json to serialize the cluster to JSON, then convert to DSLValue
+        // This makes it dynamic and automatically includes all fields from the JSON specification
+        match serde_json::to_value(&cluster) {
+            Ok(json_value) => {
+                // Convert serde_json::Value to DSLValue
+                Self::json_value_to_dsl_value(json_value)
+            }
+            Err(_) => {
+                // Fallback to a basic object if serialization fails
+                let mut obj = HashMap::new();
+                obj.insert(
+                    "error".to_string(),
+                    DSLValue::from("Failed to serialize cluster"),
+                );
+                DSLValue::Object(obj)
+            }
         }
+    }
 
-        if let Some(cloud_provider) = cluster.cloud_provider {
-            obj.insert(
-                "cloud_provider".to_string(),
-                DSLValue::from(format!("{cloud_provider:?}")),
-            );
+    /// Convert serde_json::Value to DSLValue recursively
+    fn json_value_to_dsl_value(value: serde_json::Value) -> DSLValue {
+        match value {
+            serde_json::Value::Null => DSLValue::Null,
+            serde_json::Value::Bool(b) => DSLValue::Boolean(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    DSLValue::Number(i as f64)
+                } else if let Some(f) = n.as_f64() {
+                    DSLValue::Number(f)
+                } else {
+                    DSLValue::String(n.to_string())
+                }
+            }
+            serde_json::Value::String(s) => DSLValue::String(s),
+            serde_json::Value::Array(arr) => {
+                let dsl_array = arr.into_iter().map(Self::json_value_to_dsl_value).collect();
+                DSLValue::Array(dsl_array)
+            }
+            serde_json::Value::Object(obj) => {
+                let dsl_obj = obj
+                    .into_iter()
+                    .map(|(k, v)| (k, Self::json_value_to_dsl_value(v)))
+                    .collect();
+                DSLValue::Object(dsl_obj)
+            }
         }
+    }
 
-        if let Some(region_display_name) = cluster.region_display_name {
-            obj.insert(
-                "region_display_name".to_string(),
-                DSLValue::from(region_display_name),
-            );
+    /// Convert cluster to DSLValue with only selected fields
+    fn cluster_to_dsl_value_filtered(
+        &self,
+        cluster: &Tidb,
+        selected_fields: &[String],
+    ) -> DSLValue {
+        // First get the full JSON representation
+        let full_json = match serde_json::to_value(cluster) {
+            Ok(json_value) => json_value,
+            Err(_) => {
+                // Fallback to a basic object if serialization fails
+                let mut obj = HashMap::new();
+                obj.insert(
+                    "error".to_string(),
+                    DSLValue::from("Failed to serialize cluster"),
+                );
+                return DSLValue::Object(obj);
+            }
+        };
+
+        // Filter to only selected fields
+        if let serde_json::Value::Object(mut full_obj) = full_json {
+            let mut filtered_obj = HashMap::new();
+
+            for field in selected_fields {
+                if let Some(value) = full_obj.remove(field) {
+                    filtered_obj.insert(field.clone(), Self::json_value_to_dsl_value(value));
+                }
+            }
+
+            DSLValue::Object(filtered_obj)
+        } else {
+            DSLValue::Null
         }
-
-        if let Some(root_password) = cluster.root_password {
-            obj.insert("root_password".to_string(), DSLValue::from(root_password));
-        }
-
-        if let Some(high_availability_type) = cluster.high_availability_type {
-            obj.insert(
-                "high_availability_type".to_string(),
-                DSLValue::from(format!("{high_availability_type:?}")),
-            );
-        }
-
-        if let Some(annotations) = cluster.annotations {
-            let annotations_obj = annotations
-                .into_iter()
-                .map(|(k, v)| (k, DSLValue::from(v)))
-                .collect();
-            obj.insert("annotations".to_string(), DSLValue::Object(annotations_obj));
-        }
-
-        if let Some(labels) = cluster.labels {
-            let labels_obj = labels
-                .into_iter()
-                .map(|(k, v)| (k, DSLValue::from(v)))
-                .collect();
-            obj.insert("labels".to_string(), DSLValue::Object(labels_obj));
-        }
-
-        if let Some(creator) = cluster.creator {
-            obj.insert("creator".to_string(), DSLValue::from(creator));
-        }
-
-        if let Some(create_time) = cluster.create_time {
-            obj.insert("create_time".to_string(), DSLValue::from(create_time));
-        }
-
-        if let Some(update_time) = cluster.update_time {
-            obj.insert("update_time".to_string(), DSLValue::from(update_time));
-        }
-
-        // Endpoints with full information
-        if let Some(endpoints) = cluster.endpoints {
-            let endpoints_array = endpoints
-                .into_iter()
-                .map(|e| {
-                    let mut endpoint_obj = HashMap::new();
-                    endpoint_obj.insert(
-                        "host".to_string(),
-                        DSLValue::from(e.host.unwrap_or_default()),
-                    );
-                    endpoint_obj.insert(
-                        "port".to_string(),
-                        DSLValue::from(e.port.unwrap_or(0) as f64),
-                    );
-                    if let Some(connection_type) = e.connection_type {
-                        endpoint_obj.insert(
-                            "connection_type".to_string(),
-                            DSLValue::from(format!("{connection_type:?}")),
-                        );
-                    }
-                    DSLValue::Object(endpoint_obj)
-                })
-                .collect();
-            obj.insert("endpoints".to_string(), DSLValue::Array(endpoints_array));
-        }
-
-        DSLValue::Object(obj)
     }
 
     /// Format cluster status with appropriate colors
@@ -1358,58 +1373,43 @@ impl DSLExecutor {
     }
 
     fn backup_to_dsl_value(&self, backup: Backup) -> DSLValue {
-        let mut obj = HashMap::new();
-        obj.insert(
-            "id".to_string(),
-            DSLValue::from(backup.id.unwrap_or_default()),
-        );
-        obj.insert(
-            "name".to_string(),
-            DSLValue::from(backup.display_name.unwrap_or_default()),
-        );
-        obj.insert(
-            "state".to_string(),
-            DSLValue::from(format!(
-                "{:?}",
-                backup.state.unwrap_or(BackupState::Unknown)
-            )),
-        );
-        obj.insert(
-            "size".to_string(),
-            DSLValue::from(backup.size_bytes.unwrap_or_default()),
-        );
-        obj.insert(
-            "create_time".to_string(),
-            DSLValue::from(backup.create_time.unwrap_or_default()),
-        );
-
-        DSLValue::Object(obj)
+        // Use serde_json to serialize the backup to JSON, then convert to DSLValue
+        // This makes it dynamic and automatically includes all fields from the JSON specification
+        match serde_json::to_value(&backup) {
+            Ok(json_value) => {
+                // Convert serde_json::Value to DSLValue
+                Self::json_value_to_dsl_value(json_value)
+            }
+            Err(_) => {
+                // Fallback to a basic object if serialization fails
+                let mut obj = HashMap::new();
+                obj.insert(
+                    "error".to_string(),
+                    DSLValue::from("Failed to serialize backup"),
+                );
+                DSLValue::Object(obj)
+            }
+        }
     }
 
     fn price_to_dsl_value(&self, price: EstimatePriceResponse) -> DSLValue {
-        let mut obj = HashMap::new();
-
-        if let Some(costs) = &price.costs {
-            let costs_array = costs
-                .iter()
-                .map(|c| {
-                    let mut cost_obj = HashMap::new();
-                    cost_obj.insert(
-                        "component".to_string(),
-                        DSLValue::from(format!(
-                            "{:?}",
-                            c.component_type.as_ref().unwrap_or(&ComponentType::RuCost)
-                        )),
-                    );
-                    cost_obj.insert("min".to_string(), DSLValue::from(c.min.unwrap_or(0.0)));
-                    cost_obj.insert("max".to_string(), DSLValue::from(c.max.unwrap_or(0.0)));
-                    DSLValue::Object(cost_obj)
-                })
-                .collect();
-            obj.insert("costs".to_string(), DSLValue::Array(costs_array));
+        // Use serde_json to serialize the price to JSON, then convert to DSLValue
+        // This makes it dynamic and automatically includes all fields from the JSON specification
+        match serde_json::to_value(&price) {
+            Ok(json_value) => {
+                // Convert serde_json::Value to DSLValue
+                Self::json_value_to_dsl_value(json_value)
+            }
+            Err(_) => {
+                // Fallback to a basic object if serialization fails
+                let mut obj = HashMap::new();
+                obj.insert(
+                    "error".to_string(),
+                    DSLValue::from("Failed to serialize price"),
+                );
+                DSLValue::Object(obj)
+            }
         }
-
-        DSLValue::Object(obj)
     }
 
     /// Get all variables
@@ -2066,6 +2066,675 @@ impl DSLExecutor {
             let seconds = (total_millis % 60000) / 1000;
             format!("{minutes}m {seconds}s")
         }
+    }
+
+    /// Pretty print DSLValue as a table
+    pub fn pretty_print_table(&self, data: &DSLValue) -> String {
+        match data {
+            DSLValue::Array(arr) => {
+                if arr.is_empty() {
+                    return "No data to display".to_string();
+                }
+
+                // Get all unique keys from all objects
+                let mut all_keys = std::collections::HashSet::new();
+                for item in arr {
+                    if let DSLValue::Object(obj) = item {
+                        for key in obj.keys() {
+                            all_keys.insert(key.clone());
+                        }
+                    }
+                }
+
+                let mut keys: Vec<String> = all_keys.into_iter().collect();
+                keys.sort(); // Sort keys for consistent output
+
+                if keys.is_empty() {
+                    return "No data to display".to_string();
+                }
+
+                // Check if any column contains complex nested data
+                let has_complex_data = self.has_complex_nested_data(arr, &keys);
+
+                if has_complex_data {
+                    // Use multi-line format with sub-tables for complex nested data
+                    return self.format_complex_table_with_subtables(arr, &keys);
+                }
+
+                // Calculate column widths
+                let mut column_widths = HashMap::new();
+                for key in &keys {
+                    let mut max_width = key.len();
+                    for item in arr {
+                        if let DSLValue::Object(obj) = item
+                            && let Some(value) = obj.get(key) {
+                                let value_str = self.format_value_for_table(value);
+                                max_width = max_width.max(value_str.len());
+                            }
+                    }
+                    column_widths.insert(key.clone(), max_width);
+                }
+
+                // Build the table
+                let mut table = String::new();
+
+                // Header
+                table.push('┌');
+                for (_i, key) in keys.iter().enumerate() {
+                    let width = column_widths[key];
+                    table.push_str(&"─".repeat(width + 2));
+                    if _i < keys.len() - 1 {
+                        table.push('┬');
+                    }
+                }
+                table.push_str("┐\n");
+
+                // Column headers
+                table.push('│');
+                for key in keys.iter() {
+                    let width = column_widths[key];
+                    table.push_str(&format!(" {key:<width$} │"));
+                }
+                table.push('\n');
+
+                // Separator
+                table.push('├');
+                for (_i, key) in keys.iter().enumerate() {
+                    let width = column_widths[key];
+                    table.push_str(&"─".repeat(width + 2));
+                    if _i < keys.len() - 1 {
+                        table.push('┼');
+                    }
+                }
+                table.push_str("┤\n");
+
+                // Data rows
+                for item in arr {
+                    if let DSLValue::Object(obj) = item {
+                        table.push('│');
+                        for key in keys.iter() {
+                            let width = column_widths[key];
+                            let value = obj.get(key).unwrap_or(&DSLValue::Null);
+                            let value_str = self.format_value_for_table(value);
+                            table.push_str(&format!(" {value_str:<width$} │"));
+                        }
+                        table.push('\n');
+                    }
+                }
+
+                // Footer
+                table.push('└');
+                for (_i, key) in keys.iter().enumerate() {
+                    let width = column_widths[key];
+                    table.push_str(&"─".repeat(width + 2));
+                    if _i < keys.len() - 1 {
+                        table.push('┴');
+                    }
+                }
+                table.push('┘');
+
+                table
+            }
+            DSLValue::Object(obj) => {
+                // Single object - display as key-value pairs
+                let mut table = String::new();
+                let mut keys: Vec<String> = obj.keys().cloned().collect();
+                keys.sort();
+
+                if keys.is_empty() {
+                    return "No data to display".to_string();
+                }
+
+                // Calculate column widths
+                let mut key_width = 0;
+                let mut value_width = 0;
+                for key in &keys {
+                    key_width = key_width.max(key.len());
+                    if let Some(value) = obj.get(key) {
+                        let value_str = self.format_value_for_table(value);
+                        value_width = value_width.max(value_str.len());
+                    }
+                }
+
+                // Build the table
+                let total_width = key_width + value_width + 7; // +7 for borders and spacing
+
+                // Header
+                table.push_str(&format!("┌{}┐\n", "─".repeat(total_width - 2)));
+
+                // Data rows
+                for key in &keys {
+                    if let Some(value) = obj.get(key) {
+                        let value_str = self.format_value_for_table(value);
+                        table.push_str(&format!(
+                            "│ {key:<key_width$} │ {value_str:<value_width$} │\n"
+                        ));
+                    }
+                }
+
+                // Footer
+                table.push_str(&format!("└{}┘", "─".repeat(total_width - 2)));
+
+                table
+            }
+            _ => format!("{data}"),
+        }
+    }
+
+    /// Format a value for table display
+    fn format_value_for_table(&self, value: &DSLValue) -> String {
+        match value {
+            DSLValue::Null => "null".dimmed().to_string(),
+            DSLValue::Boolean(b) => b.to_string().yellow().to_string(),
+            DSLValue::Number(n) => n.to_string().cyan().to_string(),
+            DSLValue::String(s) => s.clone(),
+            DSLValue::Array(arr) => {
+                if arr.is_empty() {
+                    "[]".to_string()
+                } else {
+                    // For arrays, convert to serde_json::Value for clean JSON
+                    let json_value = Self::dsl_value_to_json(value);
+                    let json_str = serde_json::to_string_pretty(&json_value)
+                        .unwrap_or_else(|_| format!("{value:?}"));
+                    self.format_nested_json_for_table(&json_str)
+                }
+            }
+            DSLValue::Object(obj) => {
+                if obj.is_empty() {
+                    "{}".to_string()
+                } else {
+                    // For objects, convert to serde_json::Value for clean JSON
+                    let json_value = Self::dsl_value_to_json(value);
+                    let json_str = serde_json::to_string_pretty(&json_value)
+                        .unwrap_or_else(|_| format!("{value:?}"));
+                    self.format_nested_json_for_table(&json_str)
+                }
+            }
+        }
+    }
+
+    /// Convert DSLValue to serde_json::Value for clean JSON serialization
+    fn dsl_value_to_json(value: &DSLValue) -> serde_json::Value {
+        match value {
+            DSLValue::Null => serde_json::Value::Null,
+            DSLValue::Boolean(b) => serde_json::Value::Bool(*b),
+            DSLValue::Number(n) => serde_json::Value::Number(
+                serde_json::Number::from_f64(*n).unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
+            DSLValue::String(s) => serde_json::Value::String(s.clone()),
+            DSLValue::Array(arr) => {
+                let json_array: Vec<serde_json::Value> =
+                    arr.iter().map(Self::dsl_value_to_json).collect();
+                serde_json::Value::Array(json_array)
+            }
+            DSLValue::Object(obj) => {
+                let json_obj: serde_json::Map<String, serde_json::Value> = obj
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::dsl_value_to_json(v)))
+                    .collect();
+                serde_json::Value::Object(json_obj)
+            }
+        }
+    }
+
+    /// Format nested JSON to be more readable in table format
+    fn format_nested_json_for_table(&self, json_str: &str) -> String {
+        let lines: Vec<&str> = json_str.lines().collect();
+
+        if lines.len() <= 1 {
+            // Single line JSON - return as-is
+            json_str.to_string()
+        } else {
+            // Multi-line JSON - format with compact indentation
+            let mut result = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                if i == 0 {
+                    // First line - no indentation
+                    result.push_str(line);
+                } else {
+                    // Subsequent lines - add minimal indentation
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        result.push_str("  "); // 2 spaces for indentation
+                        result.push_str(trimmed);
+                    }
+                }
+                if i < lines.len() - 1 {
+                    result.push(' '); // Use space instead of newline for table compatibility
+                }
+            }
+            result
+        }
+    }
+
+    /// Check if the data contains complex nested structures
+    fn has_complex_nested_data(&self, arr: &[DSLValue], keys: &[String]) -> bool {
+        for item in arr {
+            if let DSLValue::Object(obj) = item {
+                for key in keys {
+                    if let Some(DSLValue::Array(_) | DSLValue::Object(_)) = obj.get(key) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Format table for complex nested data using sub-tables within columns
+    fn format_complex_table_with_subtables(&self, arr: &[DSLValue], keys: &[String]) -> String {
+        // Calculate column widths
+        let mut column_widths = Vec::new();
+        for key in keys {
+            let mut max_width = key.len();
+            for item in arr {
+                if let DSLValue::Object(obj) = item
+                    && let Some(value) = obj.get(key) {
+                        let value_str = match value {
+                            DSLValue::Array(arr) => {
+                                if arr.is_empty() {
+                                    "[]".to_string()
+                                } else {
+                                    self.create_compact_sub_table_for_array(arr)
+                                }
+                            }
+                            DSLValue::Object(obj) => {
+                                if obj.is_empty() {
+                                    "{}".to_string()
+                                } else {
+                                    self.create_compact_sub_table_for_object(obj)
+                                }
+                            }
+                            _ => format!("{value}"),
+                        };
+                        max_width = max_width.max(value_str.len());
+                    }
+            }
+            column_widths.push(max_width + 2); // Add padding
+        }
+
+        // Build table content first (without frame)
+        let mut table_content = String::new();
+        table_content.push_str("Row 1:\n");
+
+        // Header row
+        for (i, key) in keys.iter().enumerate() {
+            table_content.push_str(&format!(" {:<width$} ", key, width = column_widths[i]));
+            if i < keys.len() - 1 {
+                table_content.push_str(" | ");
+            }
+        }
+        table_content.push('\n');
+
+        // Data rows with multi-line support
+        for item in arr {
+            if let DSLValue::Object(obj) = item {
+                // Get all the wrapped lines for this row
+                let mut row_lines: Vec<Vec<String>> = Vec::new();
+
+                for key in keys {
+                    let value = obj.get(key).unwrap_or(&DSLValue::Null);
+                    let value_str = match value {
+                        DSLValue::Array(arr) => {
+                            if arr.is_empty() {
+                                "[]".to_string()
+                            } else {
+                                self.create_compact_sub_table_for_array(arr)
+                            }
+                        }
+                        DSLValue::Object(obj) => {
+                            if obj.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                self.create_compact_sub_table_for_object(obj)
+                            }
+                        }
+                        _ => format!("{value}"),
+                    };
+
+                    let col_idx = keys.iter().position(|k| k == key).unwrap();
+                    let lines = self.wrap_text_to_lines(&value_str, column_widths[col_idx]);
+                    row_lines.push(lines);
+                }
+
+                // Find the maximum number of lines for this row
+                let max_lines = row_lines.iter().map(|lines| lines.len()).max().unwrap_or(1);
+
+                // Print each line of the row
+                for line_idx in 0..max_lines {
+                    for (col_idx, _key) in keys.iter().enumerate() {
+                        let lines = &row_lines[col_idx];
+                        if line_idx < lines.len() {
+                            let line_content = &lines[line_idx];
+                            table_content.push_str(&format!(
+                                " {:<width$} ",
+                                line_content,
+                                width = column_widths[col_idx]
+                            ));
+                        } else {
+                            // Fill empty space for this column
+                            table_content.push_str(&format!(
+                                " {:<width$} ",
+                                "",
+                                width = column_widths[col_idx]
+                            ));
+                        }
+                        if col_idx < keys.len() - 1 {
+                            table_content.push_str(" | ");
+                        }
+                    }
+                    table_content.push('\n');
+                }
+            }
+        }
+
+        // Simple table with just a line under headers
+        let mut final_table = String::new();
+
+        // Add content with simple formatting
+        let content_lines: Vec<&str> = table_content.lines().collect();
+        for (line_idx, line) in content_lines.iter().enumerate() {
+            if line_idx == 0 {
+                // Add the "Row 1:" line first
+                final_table.push_str(line);
+                final_table.push('\n');
+                continue;
+            }
+
+            // Add content line
+            final_table.push_str(line);
+            final_table.push('\n');
+
+            // Add separator line after header
+            if line_idx == 1 {
+                // Simple line under headers
+                for (i, width) in column_widths.iter().enumerate() {
+                    for _ in 0..*width {
+                        final_table.push('─');
+                    }
+                    if i < column_widths.len() - 1 {
+                        final_table.push('─');
+                    }
+                }
+                final_table.push('\n');
+            }
+        }
+
+        final_table
+    }
+
+    /// Wrap text to fit within column width and return lines (without column separator)
+    fn wrap_text_to_lines(&self, text: &str, column_width: usize) -> Vec<String> {
+        // Account for padding (2 spaces + 2 spaces = 4 characters)
+        let available_width = column_width.saturating_sub(4);
+
+        if text.len() <= available_width {
+            vec![text.to_string()]
+        } else {
+            // Split text into chunks that fit within available width
+            let mut lines = Vec::new();
+            let mut current_line = String::new();
+
+            for word in text.split_whitespace() {
+                if current_line.len() + word.len() < available_width {
+                    if !current_line.is_empty() {
+                        current_line.push(' ');
+                    }
+                    current_line.push_str(word);
+                } else {
+                    // Current line is full, add it to lines
+                    if !current_line.is_empty() {
+                        lines.push(current_line);
+                    }
+                    current_line = word.to_string();
+                }
+            }
+
+            // Add the last line
+            if !current_line.is_empty() {
+                lines.push(current_line);
+            }
+
+            lines
+        }
+    }
+
+    /// Create a sub-table for an array
+    #[allow(dead_code)]
+    fn create_sub_table_for_array(&self, arr: &[DSLValue]) -> String {
+        if arr.is_empty() {
+            return "[]".to_string();
+        }
+
+        let mut table = String::new();
+
+        for (i, item) in arr.iter().enumerate() {
+            let item_str = match item {
+                DSLValue::Object(obj) => self.create_compact_sub_table_for_object(obj),
+                DSLValue::Array(nested_arr) => self.create_compact_sub_table_for_array(nested_arr),
+                _ => format!("{item}"),
+            };
+
+            // Add item to table
+            table.push_str(&item_str.to_string());
+
+            if i < arr.len() - 1 {
+                table.push('\n');
+            }
+        }
+
+        table
+    }
+
+    /// Create a compact sub-table for an array (fits in column)
+    fn create_compact_sub_table_for_array(&self, arr: &[DSLValue]) -> String {
+        if arr.is_empty() {
+            return "[]".to_string();
+        }
+
+        let mut items = Vec::new();
+        for item in arr {
+            let item_str = match item {
+                DSLValue::Object(obj) => self.create_compact_sub_table_for_object(obj),
+                DSLValue::Array(nested_arr) => self.create_compact_sub_table_for_array(nested_arr),
+                _ => format!("{item}"),
+            };
+            items.push(item_str);
+        }
+
+        format!("[{}]", items.join(", "))
+    }
+
+    /// Create a sub-table for an object
+    #[allow(dead_code)]
+    fn create_sub_table_for_object(
+        &self,
+        obj: &std::collections::HashMap<String, DSLValue>,
+    ) -> String {
+        if obj.is_empty() {
+            return "{}".to_string();
+        }
+
+        let mut keys: Vec<String> = obj.keys().cloned().collect();
+        keys.sort();
+
+        // Calculate column widths
+        let mut key_width = 0;
+        let mut value_width = 0;
+        for key in &keys {
+            key_width = key_width.max(key.len());
+            if let Some(value) = obj.get(key) {
+                let value_str = match value {
+                    DSLValue::Object(nested_obj) => self.create_sub_table_for_object(nested_obj),
+                    DSLValue::Array(nested_arr) => self.create_sub_table_for_array(nested_arr),
+                    _ => format!("{value}"),
+                };
+                value_width = value_width.max(value_str.len());
+            }
+        }
+
+        let mut table = String::new();
+        let total_width = key_width + value_width + 7;
+
+        // Header
+        table.push_str(&format!("┌{}┐\n", "─".repeat(total_width - 2)));
+
+        // Data rows
+        for key in &keys {
+            if let Some(value) = obj.get(key) {
+                let value_str = match value {
+                    DSLValue::Object(nested_obj) => self.create_sub_table_for_object(nested_obj),
+                    DSLValue::Array(nested_arr) => self.create_sub_table_for_array(nested_arr),
+                    _ => format!("{value}"),
+                };
+                table.push_str(&format!(
+                    "│ {key:<key_width$} │ {value_str:<value_width$} │\n"
+                ));
+            }
+        }
+
+        // Footer
+        table.push_str(&format!("└{}┘", "─".repeat(total_width - 2)));
+
+        table
+    }
+
+    /// Create a compact sub-table for an object (fits in column)
+    fn create_compact_sub_table_for_object(
+        &self,
+        obj: &std::collections::HashMap<String, DSLValue>,
+    ) -> String {
+        if obj.is_empty() {
+            return "{}".to_string();
+        }
+
+        let mut pairs = Vec::new();
+        let mut keys: Vec<String> = obj.keys().cloned().collect();
+        keys.sort();
+
+        for key in &keys {
+            if let Some(value) = obj.get(key) {
+                let value_str = match value {
+                    DSLValue::Object(nested_obj) => {
+                        self.create_compact_sub_table_for_object(nested_obj)
+                    }
+                    DSLValue::Array(nested_arr) => {
+                        self.create_compact_sub_table_for_array(nested_arr)
+                    }
+                    _ => format!("{value}"),
+                };
+                pairs.push(format!("{key}: {value_str}"));
+            }
+        }
+
+        format!("{{{}}}", pairs.join(", "))
+    }
+
+    /// Format a sub-table to fit within a column
+    #[allow(dead_code)]
+    fn format_sub_table_in_column(&self, sub_table: &str, column_width: usize) -> String {
+        let lines: Vec<&str> = sub_table.lines().collect();
+        let mut result = String::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                result.push('│');
+            }
+
+            // Truncate or wrap the line to fit within column width
+            let truncated_line = if line.len() > column_width {
+                &line[..column_width]
+            } else {
+                line
+            };
+
+            result.push_str(&format!(
+                " {truncated_line:<column_width$} "
+            ));
+            if i < lines.len() - 1 {
+                result.push_str("│\n");
+            }
+        }
+
+        result
+    }
+
+    /// Format table for simple data using single-line format
+    #[allow(dead_code)]
+    fn format_simple_table(&self, arr: &[DSLValue], keys: &[String]) -> String {
+        // Calculate column widths
+        let mut column_widths = HashMap::new();
+        for key in keys {
+            let mut max_width = key.len();
+            for item in arr {
+                if let DSLValue::Object(obj) = item
+                    && let Some(value) = obj.get(key) {
+                        let value_str = self.format_value_for_table(value);
+                        max_width = max_width.max(value_str.len());
+                    }
+            }
+            column_widths.insert(key.clone(), max_width);
+        }
+
+        // Build the table
+        let mut table = String::new();
+
+        // Header
+        table.push('┌');
+        for (i, key) in keys.iter().enumerate() {
+            let width = column_widths[key];
+            table.push_str(&"─".repeat(width + 2));
+            if i < keys.len() - 1 {
+                table.push('┬');
+            }
+        }
+        table.push_str("┐\n");
+
+        // Column headers
+        table.push('│');
+        for key in keys {
+            let width = column_widths[key];
+            table.push_str(&format!(" {key:<width$} │"));
+        }
+        table.push('\n');
+
+        // Separator
+        table.push('├');
+        for (i, key) in keys.iter().enumerate() {
+            let width = column_widths[key];
+            table.push_str(&"─".repeat(width + 2));
+            if i < keys.len() - 1 {
+                table.push('┼');
+            }
+        }
+        table.push_str("┤\n");
+
+        // Data rows
+        for item in arr {
+            if let DSLValue::Object(obj) = item {
+                table.push('│');
+                for key in keys {
+                    let width = column_widths[key];
+                    let value = obj.get(key).unwrap_or(&DSLValue::Null);
+                    let value_str = self.format_value_for_table(value);
+                    table.push_str(&format!(" {value_str:<width$} │"));
+                }
+                table.push('\n');
+            }
+        }
+
+        // Footer
+        table.push('└');
+        for (i, key) in keys.iter().enumerate() {
+            let width = column_widths[key];
+            table.push_str(&"─".repeat(width + 2));
+            if i < keys.len() - 1 {
+                table.push('┴');
+            }
+        }
+        table.push('┘');
+
+        table
     }
 
     /// Convert infix condition to RPN (Reverse Polish Notation)
@@ -3533,5 +4202,385 @@ mod tests {
             update_time: Some("2023-01-01T00:00:00Z".to_string()),
             endpoints: None,
         }
+    }
+
+    #[test]
+    fn test_dynamic_json_extraction() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+        let cluster = create_test_cluster("test-cluster", "ACTIVE", "us-east-1");
+
+        // Test that the dynamic JSON extraction includes all fields
+        let dsl_value = executor.cluster_to_dsl_value(cluster);
+
+        if let DSLValue::Object(obj) = dsl_value {
+            // Print all available fields for debugging
+            println!("Available fields: {:?}", obj.keys().collect::<Vec<_>>());
+
+            // Verify that key fields are present (using the actual JSON field names)
+            assert!(obj.contains_key("name"));
+            assert!(obj.contains_key("displayName")); // JSON field name, not display_name
+            assert!(obj.contains_key("regionId")); // JSON field name, not region_id
+            assert!(obj.contains_key("state"));
+            assert!(obj.contains_key("minRcu")); // JSON field name, not min_rcu
+            assert!(obj.contains_key("maxRcu")); // JSON field name, not max_rcu
+            assert!(obj.contains_key("servicePlan")); // JSON field name, not service_plan
+            assert!(obj.contains_key("cloudProvider")); // JSON field name, not cloud_provider
+            assert!(obj.contains_key("highAvailabilityType")); // JSON field name, not high_availability_type
+            assert!(obj.contains_key("creator"));
+            assert!(obj.contains_key("createTime")); // JSON field name, not create_time
+            assert!(obj.contains_key("updateTime")); // JSON field name, not update_time
+
+            // Verify that the field values are correct
+            assert_eq!(
+                obj.get("displayName"),
+                Some(&DSLValue::String("test-cluster".to_string()))
+            );
+            assert_eq!(
+                obj.get("regionId"),
+                Some(&DSLValue::String("us-east-1".to_string()))
+            );
+        } else {
+            panic!("Expected DSLValue::Object");
+        }
+    }
+
+    #[test]
+    fn test_pretty_print_table() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+
+        // Test with array of objects
+        let data = DSLValue::Array(vec![
+            DSLValue::Object({
+                let mut obj = HashMap::new();
+                obj.insert("name".to_string(), DSLValue::String("cluster1".to_string()));
+                obj.insert("state".to_string(), DSLValue::String("ACTIVE".to_string()));
+                obj
+            }),
+            DSLValue::Object({
+                let mut obj = HashMap::new();
+                obj.insert("name".to_string(), DSLValue::String("cluster2".to_string()));
+                obj.insert(
+                    "state".to_string(),
+                    DSLValue::String("INACTIVE".to_string()),
+                );
+                obj
+            }),
+        ]);
+
+        let table = executor.pretty_print_table(&data);
+        println!("Generated table:\n{}", table);
+
+        // Verify the table contains expected elements
+        assert!(table.contains("name"));
+        assert!(table.contains("state"));
+        assert!(table.contains("cluster1"));
+        assert!(table.contains("cluster2"));
+        assert!(table.contains("ACTIVE"));
+        assert!(table.contains("INACTIVE"));
+        assert!(table.contains("┌")); // Header
+        assert!(table.contains("└")); // Footer
+    }
+
+    #[test]
+    fn test_pretty_print_table_with_complex_data() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+
+        // Test with the actual data format from the user's example
+        let data = DSLValue::Array(vec![DSLValue::Object({
+            let mut obj = HashMap::new();
+            obj.insert(
+                "highAvailabilityType".to_string(),
+                DSLValue::String("REGIONAL".to_string()),
+            );
+            obj.insert(
+                "displayName".to_string(),
+                DSLValue::String("SB-Test01-delete-whenever".to_string()),
+            );
+            obj.insert(
+                "endpoints".to_string(),
+                DSLValue::Array(vec![DSLValue::Object({
+                    let mut endpoint = HashMap::new();
+                    endpoint.insert("port".to_string(), DSLValue::Number(4000.0));
+                    endpoint.insert(
+                        "connectionType".to_string(),
+                        DSLValue::String("PUBLIC".to_string()),
+                    );
+                    endpoint.insert(
+                        "host".to_string(),
+                        DSLValue::String(
+                            "tidb.hcrmzl1vj561.clusters.dev.tidb-cloud.com".to_string(),
+                        ),
+                    );
+                    endpoint
+                })]),
+            );
+            obj
+        })]);
+
+        let table = executor.pretty_print_table(&data);
+        println!("Complex data table:\n{}", table);
+
+        // Verify the table contains expected elements
+        assert!(table.contains("highAvailabilityType"));
+        assert!(table.contains("displayName"));
+        assert!(table.contains("endpoints"));
+        assert!(table.contains("REGIONAL"));
+        assert!(table.contains("SB-Test01-delete-whenever"));
+        assert!(table.contains("connectionType")); // Sub-table content
+        assert!(table.contains("host")); // Sub-table content
+        assert!(table.contains("PUBLIC")); // Sub-table content
+        assert!(table.contains("port")); // Sub-table content
+        assert!(table.contains("4000")); // Sub-table content
+        assert!(table.contains("─")); // Separator line
+    }
+
+    #[test]
+    fn test_pretty_print_table_with_deeply_nested_data() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+
+        // Test with deeply nested JSON structures
+        let data = DSLValue::Array(vec![DSLValue::Object({
+            let mut obj = HashMap::new();
+            obj.insert("name".to_string(), DSLValue::String("cluster1".to_string()));
+            obj.insert(
+                "config".to_string(),
+                DSLValue::Object({
+                    let mut config = HashMap::new();
+                    config.insert(
+                        "network".to_string(),
+                        DSLValue::Object({
+                            let mut network = HashMap::new();
+                            network
+                                .insert("vpc".to_string(), DSLValue::String("vpc-123".to_string()));
+                            network.insert(
+                                "subnets".to_string(),
+                                DSLValue::Array(vec![
+                                    DSLValue::String("subnet-1".to_string()),
+                                    DSLValue::String("subnet-2".to_string()),
+                                ]),
+                            );
+                            network
+                        }),
+                    );
+                    config.insert(
+                        "security".to_string(),
+                        DSLValue::Object({
+                            let mut security = HashMap::new();
+                            security.insert(
+                                "firewall_rules".to_string(),
+                                DSLValue::Array(vec![
+                                    DSLValue::Object({
+                                        let mut rule1 = HashMap::new();
+                                        rule1.insert("port".to_string(), DSLValue::Number(3306.0));
+                                        rule1.insert(
+                                            "source".to_string(),
+                                            DSLValue::String("0.0.0.0/0".to_string()),
+                                        );
+                                        rule1
+                                    }),
+                                    DSLValue::Object({
+                                        let mut rule2 = HashMap::new();
+                                        rule2.insert("port".to_string(), DSLValue::Number(22.0));
+                                        rule2.insert(
+                                            "source".to_string(),
+                                            DSLValue::String("10.0.0.0/8".to_string()),
+                                        );
+                                        rule2
+                                    }),
+                                ]),
+                            );
+                            security
+                        }),
+                    );
+                    config
+                }),
+            );
+            obj.insert(
+                "metadata".to_string(),
+                DSLValue::Object({
+                    let mut metadata = HashMap::new();
+                    metadata.insert(
+                        "tags".to_string(),
+                        DSLValue::Array(vec![
+                            DSLValue::String("production".to_string()),
+                            DSLValue::String("database".to_string()),
+                        ]),
+                    );
+                    metadata.insert(
+                        "created_by".to_string(),
+                        DSLValue::String("admin".to_string()),
+                    );
+                    metadata
+                }),
+            );
+            obj
+        })]);
+
+        let table = executor.pretty_print_table(&data);
+        println!("Deeply nested data table:\n{}", table);
+
+        // Verify the table contains expected elements
+        assert!(table.contains("name"));
+        assert!(table.contains("config"));
+        assert!(table.contains("metadata"));
+        assert!(table.contains("cluster1"));
+        assert!(table.contains("network"));
+        assert!(table.contains("security"));
+        assert!(table.contains("vpc-123"));
+        assert!(table.contains("subnet-1"));
+        assert!(table.contains("subnet-2"));
+        assert!(table.contains("admin"));
+        assert!(table.contains("firewall_rules")); // Sub-table content
+        assert!(table.contains("3306")); // Sub-table content
+        assert!(table.contains("22")); // Sub-table content
+        assert!(table.contains("production")); // Sub-table content
+        assert!(table.contains("database")); // Sub-table content
+        assert!(table.contains("─")); // Separator line
+    }
+
+    #[test]
+    fn test_sub_table_formatting() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+
+        // Test with simple nested data to see sub-table formatting
+        let data = DSLValue::Array(vec![DSLValue::Object({
+            let mut obj = HashMap::new();
+            obj.insert(
+                "name".to_string(),
+                DSLValue::String("test-cluster".to_string()),
+            );
+            obj.insert(
+                "endpoints".to_string(),
+                DSLValue::Array(vec![DSLValue::Object({
+                    let mut endpoint = HashMap::new();
+                    endpoint.insert(
+                        "host".to_string(),
+                        DSLValue::String("example.com".to_string()),
+                    );
+                    endpoint.insert("port".to_string(), DSLValue::Number(4000.0));
+                    endpoint
+                })]),
+            );
+            obj
+        })]);
+
+        // Debug: Check if complex data is detected
+        let keys = vec!["name".to_string(), "endpoints".to_string()];
+        let has_complex = executor.has_complex_nested_data(&data.as_array().unwrap(), &keys);
+        println!("Has complex data: {}", has_complex);
+
+        let table = executor.pretty_print_table(&data);
+        println!("Sub-table test:\n{}", table);
+
+        // Check if it's using the sub-table format
+        assert!(table.contains("Row 1:"));
+        assert!(table.contains("name"));
+        assert!(table.contains("endpoints"));
+        assert!(table.contains("test-cluster"));
+        assert!(table.contains("host"));
+        assert!(table.contains("port"));
+        assert!(table.contains("example.com"));
+        assert!(table.contains("4000")); // Sub-table content
+    }
+
+    #[test]
+    fn test_recursive_sub_table_formatting() {
+        let executor = DSLExecutor::new(MockTiDBCloudClient::new());
+
+        // Test with deeply nested recursive data
+        let data = DSLValue::Array(vec![DSLValue::Object({
+            let mut obj = HashMap::new();
+            obj.insert(
+                "cluster".to_string(),
+                DSLValue::String("main-cluster".to_string()),
+            );
+            obj.insert(
+                "config".to_string(),
+                DSLValue::Object({
+                    let mut config = HashMap::new();
+                    config.insert(
+                        "database".to_string(),
+                        DSLValue::Object({
+                            let mut db = HashMap::new();
+                            db.insert(
+                                "instances".to_string(),
+                                DSLValue::Array(vec![
+                                    DSLValue::Object({
+                                        let mut instance1 = HashMap::new();
+                                        instance1.insert(
+                                            "id".to_string(),
+                                            DSLValue::String("db-1".to_string()),
+                                        );
+                                        instance1.insert(
+                                            "settings".to_string(),
+                                            DSLValue::Object({
+                                                let mut settings = HashMap::new();
+                                                settings.insert(
+                                                    "max_connections".to_string(),
+                                                    DSLValue::Number(100.0),
+                                                );
+                                                settings.insert(
+                                                    "timeout".to_string(),
+                                                    DSLValue::Number(30.0),
+                                                );
+                                                settings
+                                            }),
+                                        );
+                                        instance1
+                                    }),
+                                    DSLValue::Object({
+                                        let mut instance2 = HashMap::new();
+                                        instance2.insert(
+                                            "id".to_string(),
+                                            DSLValue::String("db-2".to_string()),
+                                        );
+                                        instance2.insert(
+                                            "settings".to_string(),
+                                            DSLValue::Object({
+                                                let mut settings = HashMap::new();
+                                                settings.insert(
+                                                    "max_connections".to_string(),
+                                                    DSLValue::Number(200.0),
+                                                );
+                                                settings.insert(
+                                                    "timeout".to_string(),
+                                                    DSLValue::Number(60.0),
+                                                );
+                                                settings
+                                            }),
+                                        );
+                                        instance2
+                                    }),
+                                ]),
+                            );
+                            db
+                        }),
+                    );
+                    config
+                }),
+            );
+            obj
+        })]);
+
+        let table = executor.pretty_print_table(&data);
+        println!("Recursive sub-table test:\n{}", table);
+
+        // Check if it's using the recursive sub-table format
+        assert!(table.contains("Row 1:"));
+        assert!(table.contains("cluster"));
+        assert!(table.contains("config"));
+        assert!(table.contains("main-cluster"));
+        assert!(table.contains("database"));
+        assert!(table.contains("instances"));
+        assert!(table.contains("db-1"));
+        assert!(table.contains("settings"));
+        assert!(table.contains("max_connections"));
+        assert!(table.contains("timeout"));
+        assert!(table.contains("100"));
+        assert!(table.contains("30"));
+        assert!(table.contains("db-2")); // Sub-table content
+        assert!(table.contains("200")); // Sub-table content
+        assert!(table.contains("60")); // Sub-table content
+        assert!(table.contains("─")); // Separator line
     }
 }
