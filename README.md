@@ -1,6 +1,6 @@
-# TiDB DSL CLI
+# TiDB CLI
 
-A standalone command-line interface for TiDB Cloud DSL (Domain Specific Language) operations. This tool provides a simple, declarative syntax for managing TiDB Cloud resources.
+A standalone command-line interface for TiDB Cloud operations. This tool provides a simple, declarative syntax for managing TiDB Cloud resources.
 
 ## Features
 
@@ -146,7 +146,7 @@ cargo clippy
 
 ## License
 
-MIT License - see LICENSE file for details.
+Apache 2.0 License - see LICENSE file for details.
 
 ## Contributing
 

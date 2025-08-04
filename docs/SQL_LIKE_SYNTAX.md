@@ -1,10 +1,10 @@
-# SQL-like DSL Syntax for TiDB Cloud CLI
+# SQL-like Syntax for TiDB Cloud CLI
 
-This document describes the SQL-like syntax for the TiDB Cloud CLI DSL, which provides a familiar interface for users accustomed to SQL while maintaining full compatibility with the existing DSL parser. The implementation includes a powerful Reverse Polish Notation (RPN) based condition evaluator for complex WHERE clauses.
+This document describes the SQL-like syntax for the TiDB Cloud CLI DSL, which provides a familiar interface for users accustomed to SQL while maintaining full compatibility with the existing DSL parser. The implementation includes a simple WHERE clause interface.
 
 ## Overview
 
-The SQL-like parser transforms SQL-style commands into the existing DSL syntax, allowing users to use familiar SQL patterns while leveraging the robust existing parser infrastructure. The WHERE clause evaluation uses an advanced RPN-based system that supports complex boolean expressions with proper operator precedence.
+The SQL-like parser transforms SQL-style commands into the existing DSL syntax, allowing users to use familiar SQL patterns while leveraging the existing parser infrastructure. The WHERE clause evaluation uses an  RPN-based system that supports boolean expressions with operator precedence.
 
 **Supported SQL-like commands:**
 - `SELECT * FROM CLUSTER [WHERE condition]` - List clusters with advanced filtering
@@ -40,7 +40,7 @@ The WHERE clause supports complex boolean expressions using a Reverse Polish Not
 
 ### Operator Precedence
 
-The RPN evaluator implements proper operator precedence (highest to lowest):
+The RPN evaluator implements operator precedence (highest to lowest):
 
 1. **Comparison operators** (`=`, `!=`, `<`, `<=`, `>`, `>=`) - precedence 4
 2. **NOT** - precedence 3  
@@ -506,7 +506,7 @@ This approach ensures:
 
 ## Testing
 
-The implementation includes comprehensive tests covering:
+The implementation includes tests covering:
 - Simple field comparisons
 - Logical operators (AND, OR, NOT)
 - Parentheses and operator precedence
@@ -520,9 +520,7 @@ The implementation includes comprehensive tests covering:
 
 Potential future enhancements could include:
 
-- Support for more SQL-like commands (INSERT, ALTER, etc.)
-- Subqueries and complex WHERE clauses
-- JOIN-like operations for cross-resource queries
+- Support for more SQL-like commands (ALTER, etc.)
 - Aggregation functions (COUNT, SUM, etc.)
 - ORDER BY and LIMIT clauses
 - Support for arithmetic expressions
@@ -595,4 +593,4 @@ SELECT display_name, region INTO updated_name, updated_region FROM CLUSTER WHERE
 DROP CLUSTER test-cluster;
 ```
 
-This SQL-like syntax provides a familiar interface while maintaining all the power and flexibility of the existing TiDB Cloud CLI DSL, enhanced with advanced RPN-based WHERE clause evaluation for complex filtering scenarios. 
+This SQL-like syntax provides a familiar interface while maintaining all the power and flexibility of the existing TiDB Cloud CLI DSL, enhanced with RPN-based WHERE clause evaluation for complex filtering scenarios. 
