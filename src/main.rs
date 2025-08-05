@@ -12,6 +12,9 @@ use tidb_cli::{
     logging::{LogConfig, init_logging},
     tidb_cloud::{DebugLogger, TiDBCloudClient, constants::VerbosityLevel},
 };
+
+#[cfg(test)]
+use tidb_cli::dsl::commands::DSLCommandType;
 use tokio::signal;
 use tracing::Level;
 
@@ -1535,5 +1538,13 @@ mod tests {
     fn test_parse_command_with_sql_fallback_dsl_command() {
         let result = parse_command_with_sql_fallback("list clusters");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_command_with_sql_fallback_backups_all_clusters() {
+        let result = parse_command_with_sql_fallback("SELECT * FROM BACKUPS");
+        assert!(result.is_ok());
+        let command = result.unwrap();
+        assert_eq!(command.command_type, DSLCommandType::ListBackups);
     }
 }

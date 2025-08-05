@@ -7,13 +7,190 @@ use crate::dsl::commands::DSLCommandType;
 
 /// SQL-like DSL Parser
 ///
-/// This parser implements a SQL-like syntax for TiDB Cloud operations:
-/// - SELECT * FROM CLUSTER <name|id> WHERE <condition>
-/// - SELECT <field_list> FROM CLUSTER <name|id> WHERE <condition>
-/// - CREATE CLUSTER <name> IN <region> WITH <options>
-/// - DELETE FROM CLUSTER <name|id>
-/// - UPDATE CLUSTER <name|id> SET <field> = <value>
-/// - WAIT FOR CLUSTER <name|id> TO BE <state>
+/// This parser implements a SQL-like syntax for TiDB Cloud operations.
+///
+/// # SQL Grammar Syntax Diagrams
+///
+/// ## SELECT Statement
+///
+/// ### SELECT from CLUSTER
+/// ```text
+/// SELECT ──┬─ * ──────────────┬─ FROM ── CLUSTER ── identifier ──┬─ WHERE ── condition
+///          │                  │                                  │                       
+///          └─ field_list ─────┘                                  └─ empty
+///                                                                                           
+///                                                                                           
+/// ```
+///
+/// ### SELECT from BACKUPS
+/// ```text
+/// SELECT ──┬─ * ──────────────┬─ FROM ── BACKUPS ──┬─ WHERE ── displayName = 'pattern' ──┬─ AND ── condition
+///          │                  │                    │                                     |         
+///          └─ field_list ─────┘                    └─ (no WHERE = all clusters)          └─--- empty
+/// ```
+///
+/// ### Field List
+/// ```text
+/// field_list ── field_name ──┬─ , ── field_name ──┬─┘
+///                            │                    │
+///                            └─ (repeat) ─────────┘
+/// ```
+///
+/// ### Condition
+/// ```text
+/// condition ──----field_name ── operator ── value
+///               |                                     
+///               |--- condition ── boolean_operator ── condition                               
+///               |
+///               |--- NOT ── condition
+///                                                                        
+/// ```
+///
+/// ### Operator
+/// ```text
+/// operator ──┬─ = ─--─┬─
+///            │        │
+///            ├─ != --─┤
+///            │        │
+///            ├─ > --──┤
+///            │        │
+///            ├─ < --──┤
+///            │        │
+///            ├─ >= --─┤
+///            │        │
+///            ├─ <= ───┤
+///            │        │
+///            ├─ LIKE ─┤
+///            │        │
+///            └─ IN ───┘
+/// ```
+///
+/// ### Boolean Operator
+/// ```text
+/// boolean_operator ──┬─ AND ──┬─
+///                    │        │
+///                    ├─ OR ───┤
+///                    │        │
+///                    └─ NOT ──┘
+/// ```
+///
+/// ## CREATE Statement
+/// ```text
+/// CREATE ── CLUSTER ── identifier ── IN ── region ──┬─ WITH ── option_list ──┬─┘
+///                                                   │                        │
+///                                                   └─ (optional) ───────────┘
+/// ```
+///
+/// ### Option List
+/// ```text
+/// option_list ── option ──┬─ , ── option ──┬─┘
+///                         │                │
+///                         └─ (repeat) ─────┘
+/// ```
+///
+/// ### Option
+/// ```text
+/// option ──┬─ rcu = value ──┬─
+///          │                 │
+///          ├─ storage = value ─┤
+///          │                   │
+///          ├─ password = value ─┤
+///          │                     │
+///          ├─ description = value ─┤
+///          │                       │
+///          └─ config = json_object ─┘
+/// ```
+///
+/// ## UPDATE Statement
+/// ```text
+/// UPDATE ── CLUSTER ── identifier ──┬─ SET ── field = value ──┬─ WHERE ── condition ──┬─┘
+///                                   │                         │                       │
+///                                   └─ WITH ── option_list ───┘                       │
+///                                                                                     │
+///                                                                                     └─ (optional)
+/// ```
+///
+/// ## DELETE/DROP Statement
+/// ```text
+/// DELETE ── FROM ── CLUSTER ── identifier
+/// DROP ─── CLUSTER ── identifier
+/// ```
+///
+/// ## WAIT Statement
+/// ```text
+/// WAIT ── FOR ── CLUSTER ── identifier ── TO ── BE ── state ──┬─ WITH ── timeout = value ──┬─┘
+///                                                             │                            │
+///                                                             └─ (optional) ───────────────┘
+/// ```
+///
+/// ### State
+/// ```text
+/// state ──┬─ 'available' ──┬─
+///         │                 │
+///         ├─ 'creating' ────┤
+///         │                 │
+///         ├─ 'deleting' ────┤
+///         │                 │
+///         ├─ 'failed' ──────┤
+///         │                 │
+///         ├─ 'modifying' ───┤
+///         │                 │
+///         ├─ 'paused' ──────┤
+///         │                 │
+///         ├─ 'resuming' ────┤
+///         │                 │
+///         ├─ 'suspending' ──┤
+///         │                 │
+///         └─ 'unavailable' ─┘
+/// ```
+///
+/// ## Value Types
+/// ```text
+/// value ──┬─ string_literal ──┬─  (quoted with single or double quotes)
+///         │                    │
+///         ├─ number ───────────┤
+///         │                    │
+///         ├─ boolean ──────────┤  (true, false)
+///         │                    │
+///         ├─ null ─────────────┤
+///         │                    │
+///         ├─ array ────────────┤  [value, value, ...] (used with IN operator)
+///         │                    │
+///         └─ json_object ──────┘  {key: value, ...}
+/// ```
+///
+/// ## Examples
+/// ```sql
+/// -- List all clusters
+/// SELECT * FROM CLUSTER
+///
+/// -- List specific cluster fields
+/// SELECT id, displayName, state FROM CLUSTER my-cluster
+///
+/// -- List clusters with condition
+/// SELECT * FROM CLUSTER WHERE state = 'available'
+///
+/// -- List all backups from all clusters
+/// SELECT * FROM BACKUPS
+///
+/// -- List backups for specific cluster
+/// SELECT id, displayName FROM BACKUPS WHERE displayName = 'my-cluster'
+///
+/// -- List backups with additional conditions
+/// SELECT * FROM BACKUPS WHERE displayName = 'my-cluster' AND state = 'succeeded'
+///
+/// -- Create cluster
+/// CREATE CLUSTER my-cluster IN us-east-1 WITH rcu = 1, storage = 10
+///
+/// -- Update cluster
+/// UPDATE CLUSTER my-cluster SET rcu = 2 WHERE state = 'available'
+///
+/// -- Wait for cluster state
+/// WAIT FOR CLUSTER my-cluster TO BE available WITH timeout = 300
+///
+/// -- Delete cluster
+/// DELETE FROM CLUSTER my-cluster
+/// ```
 pub struct SQLDSLParser;
 
 impl SQLDSLParser {
@@ -73,6 +250,8 @@ impl SQLDSLParser {
     /// Transform SELECT command
     /// SELECT * FROM CLUSTER [name] [WHERE condition] -> LIST CLUSTERS [WHERE condition]
     /// SELECT field1, field2 FROM CLUSTER [name] [WHERE condition] -> LIST CLUSTERS [WHERE condition] or GET CLUSTER [name]
+    /// SELECT * FROM BACKUPS WHERE displayName = [pattern] [AND condition] -> LIST BACKUPS WHERE displayName = [pattern] [WHERE condition]
+    /// SELECT field1, field2 FROM BACKUPS WHERE displayName = [pattern] [AND condition] -> LIST BACKUPS WHERE displayName = [pattern] [WHERE condition]
     fn transform_select(input: &str) -> DSLResult<String> {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
@@ -105,111 +284,239 @@ impl SQLDSLParser {
         // Check if it's SELECT * (all fields)
         let is_select_all = field_list.len() == 1 && field_list[0] == "*";
 
-        // If not SELECT *, validate that the requested fields exist
-        if !is_select_all {
-            let valid_fields = Self::get_valid_cluster_fields();
-            for field in field_list {
-                let field_clean = field.trim_matches(',');
-                if !valid_fields.contains(&field_clean) {
-                    return Err(DSLError::syntax_error(
-                        0,
-                        format!(
-                            "Invalid field '{}' in SELECT. Valid fields are: {}",
-                            field_clean,
-                            valid_fields.join(", ")
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Find FROM CLUSTER position
+        // Find FROM CLUSTER or FROM BACKUP/BACKUPS position
         let from_cluster_pos = parts
             .iter()
             .enumerate()
             .find(|(_, part)| part.to_uppercase() == "FROM")
             .and_then(|(i, _)| {
-                if i + 1 < parts.len() && parts[i + 1].to_uppercase() == "CLUSTER" {
-                    Some(i)
+                if i + 1 < parts.len() {
+                    match parts[i + 1].to_uppercase().as_str() {
+                        "CLUSTER" => Some((i, "CLUSTER")),
+                        "BACKUPS" | "BACKUP" => Some((i, "BACKUPS")),
+                        _ => None,
+                    }
                 } else {
                     None
                 }
             })
-            .ok_or_else(|| DSLError::syntax_error(0, "Expected FROM CLUSTER"))?;
+            .ok_or_else(|| {
+                DSLError::syntax_error(0, "Expected FROM CLUSTER or FROM BACKUP/BACKUPS")
+            })?;
 
-        // Check if there's a specific cluster name after FROM CLUSTER
-        let has_cluster_name = from_cluster_pos + 2 < parts.len()
-            && !["WHERE", "INTO"].contains(&parts[from_cluster_pos + 2].to_uppercase().as_str());
+        let (from_pos, from_type) = from_cluster_pos;
 
-        let mut result = if has_cluster_name {
-            // SELECT * FROM CLUSTER <name> -> GET CLUSTER <name>
-            let cluster_name = parts[from_cluster_pos + 2];
-            format!("GET CLUSTER {cluster_name}")
-        } else {
-            // SELECT * FROM CLUSTER -> LIST CLUSTERS
-            "LIST CLUSTERS".to_string()
-        };
+        match from_type {
+            "CLUSTER" => {
+                // Handle CLUSTER queries
+                // If not SELECT *, validate that the requested fields exist
+                if !is_select_all {
+                    let valid_fields = Self::get_valid_cluster_fields();
+                    for field in field_list {
+                        let field_clean = field.trim_matches(',');
+                        if !valid_fields.contains(&field_clean) {
+                            return Err(DSLError::syntax_error(
+                                0,
+                                format!(
+                                    "Invalid field '{}' in SELECT. Valid fields are: {}",
+                                    field_clean,
+                                    valid_fields.join(", ")
+                                ),
+                            ));
+                        }
+                    }
+                }
 
-        // Add field selection parameter if not SELECT *
-        if !is_select_all {
-            let fields_str = field_list
-                .iter()
-                .map(|f| f.trim_matches(','))
-                .filter(|f| !f.is_empty())
-                .collect::<Vec<_>>()
-                .join(",");
-            result.push_str(&format!(" WITH selected_fields = \"{fields_str}\""));
+                // Check if there's a specific cluster name after FROM CLUSTER
+                let has_cluster_name = from_pos + 2 < parts.len()
+                    && !["WHERE", "INTO"].contains(&parts[from_pos + 2].to_uppercase().as_str());
+
+                let mut result = if has_cluster_name {
+                    // SELECT * FROM CLUSTER <name> -> GET CLUSTER <name>
+                    let cluster_name = parts[from_pos + 2];
+                    format!("GET CLUSTER {cluster_name}")
+                } else {
+                    // SELECT * FROM CLUSTER -> LIST CLUSTERS
+                    "LIST CLUSTERS".to_string()
+                };
+
+                // Add field selection parameter if not SELECT *
+                if !is_select_all {
+                    let fields_str = field_list
+                        .iter()
+                        .map(|f| f.trim_matches(','))
+                        .filter(|f| !f.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    result.push_str(&format!(" WITH selected_fields = \"{fields_str}\""));
+                }
+
+                // Add WHERE clause if present (after FROM CLUSTER or cluster name)
+                let where_start_pos = if has_cluster_name {
+                    from_pos + 3
+                } else {
+                    from_pos + 2
+                };
+                if let Some(where_index) = parts[where_start_pos..]
+                    .iter()
+                    .position(|&p| p.to_uppercase() == "WHERE")
+                    .map(|pos| where_start_pos + pos)
+                {
+                    let where_clause = parts[where_index..].join(" ");
+                    result.push_str(&format!(" {where_clause}"));
+                }
+
+                // Add INTO clause if present (before FROM CLUSTER)
+                if let Some(into_index) = parts[..from_pos]
+                    .iter()
+                    .position(|&p| p.to_uppercase() == "INTO")
+                {
+                    let into_clause = parts[into_index..from_pos].join(" ");
+                    result.push_str(&format!(" {into_clause}"));
+                }
+
+                Ok(result)
+            }
+            "BACKUPS" => {
+                // Handle BACKUPS queries
+                // If not SELECT *, validate that the requested fields exist
+                if !is_select_all {
+                    let valid_fields = Self::get_valid_backup_fields();
+                    for field in field_list {
+                        let field_clean = field.trim_matches(',');
+                        if !valid_fields.contains(&field_clean) {
+                            return Err(DSLError::syntax_error(
+                                0,
+                                format!(
+                                    "Invalid field '{}' in SELECT. Valid fields are: {}",
+                                    field_clean,
+                                    valid_fields.join(", ")
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                // Check if there's a WHERE clause after FROM BACKUPS
+                let where_pos = from_pos + 2;
+                let has_where_clause =
+                    where_pos < parts.len() && parts[where_pos].to_uppercase() == "WHERE";
+
+                if has_where_clause {
+                    // Parse the WHERE clause to find tidbId = cluster_name
+                    let where_clause_start = where_pos + 1;
+                    if where_clause_start >= parts.len() {
+                        return Err(DSLError::syntax_error(0, "Expected condition after WHERE"));
+                    }
+
+                    // Look for displayName = pattern to match cluster names
+                    let mut cluster_pattern = None;
+                    let mut additional_conditions = Vec::new();
+                    let mut i = where_clause_start;
+
+                    while i < parts.len() {
+                        if i + 2 < parts.len()
+                            && parts[i].to_lowercase() == "displayname"
+                            && parts[i + 1] == "="
+                        {
+                            cluster_pattern = Some(parts[i + 2].trim_matches('\''));
+                            i += 3;
+                        } else if i + 1 < parts.len() && parts[i].to_uppercase() == "AND" {
+                            // Skip AND and collect the rest as additional conditions
+                            i += 1;
+                            additional_conditions = parts[i..].to_vec();
+                            break;
+                        } else {
+                            // If we don't find displayName = pattern, treat the whole WHERE clause as additional conditions
+                            additional_conditions = parts[where_clause_start..].to_vec();
+                            break;
+                        }
+                    }
+
+                    if cluster_pattern.is_none() {
+                        return Err(DSLError::syntax_error(
+                            0,
+                            "Expected 'displayName = <cluster-pattern>' in WHERE clause",
+                        ));
+                    }
+
+                    let cluster_pattern = cluster_pattern.unwrap();
+                    let mut result =
+                        format!("LIST BACKUPS WHERE displayName = '{cluster_pattern}'");
+
+                    // Add field selection parameter if not SELECT *
+                    if !is_select_all {
+                        let fields_str = field_list
+                            .iter()
+                            .map(|f| f.trim_matches(','))
+                            .filter(|f| !f.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        result.push_str(&format!(" WITH selected_fields = \"{fields_str}\""));
+                    }
+
+                    // Add additional WHERE conditions if present
+                    if !additional_conditions.is_empty() {
+                        result.push_str(&format!(" WHERE {}", additional_conditions.join(" ")));
+                    }
+
+                    // Add INTO clause if present (before FROM BACKUPS)
+                    if let Some(into_index) = parts[..from_pos]
+                        .iter()
+                        .position(|&p| p.to_uppercase() == "INTO")
+                    {
+                        let into_clause = parts[into_index..from_pos].join(" ");
+                        result.push_str(&format!(" {into_clause}"));
+                    }
+
+                    Ok(result)
+                } else {
+                    // No WHERE clause - check if there are any additional tokens after FROM BACKUPS
+                    if from_pos + 2 < parts.len() {
+                        return Err(DSLError::syntax_error(
+                            0,
+                            "Expected WHERE after FROM BACKUPS. Use: SELECT * FROM BACKUPS WHERE displayName = <cluster-pattern> or SELECT * FROM BACKUPS to list all backups",
+                        ));
+                    }
+
+                    // No WHERE clause - list all backups from all clusters
+                    let mut result = "LIST BACKUPS".to_string();
+
+                    // Add field selection parameter if not SELECT *
+                    if !is_select_all {
+                        let fields_str = field_list
+                            .iter()
+                            .map(|f| f.trim_matches(','))
+                            .filter(|f| !f.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        result.push_str(&format!(" WITH selected_fields = \"{fields_str}\""));
+                    }
+
+                    // Add INTO clause if present (before FROM BACKUPS)
+                    if let Some(into_index) = parts[..from_pos]
+                        .iter()
+                        .position(|&p| p.to_uppercase() == "INTO")
+                    {
+                        let into_clause = parts[into_index..from_pos].join(" ");
+                        result.push_str(&format!(" {into_clause}"));
+                    }
+
+                    Ok(result)
+                }
+            }
+            _ => unreachable!(),
         }
-
-        // Add WHERE clause if present (after FROM CLUSTER or cluster name)
-        let where_start_pos = if has_cluster_name {
-            from_cluster_pos + 3
-        } else {
-            from_cluster_pos + 2
-        };
-        if let Some(where_index) = parts[where_start_pos..]
-            .iter()
-            .position(|&p| p.to_uppercase() == "WHERE")
-            .map(|pos| where_start_pos + pos)
-        {
-            let where_clause = parts[where_index..].join(" ");
-            result.push_str(&format!(" {where_clause}"));
-        }
-
-        // Add INTO clause if present (before FROM CLUSTER)
-        if let Some(into_index) = parts[..from_cluster_pos]
-            .iter()
-            .position(|&p| p.to_uppercase() == "INTO")
-        {
-            let into_clause = parts[into_index..from_cluster_pos].join(" ");
-            result.push_str(&format!(" {into_clause}"));
-        }
-
-        Ok(result)
     }
 
     /// Get the list of valid fields for cluster objects
     fn get_valid_cluster_fields() -> Vec<&'static str> {
-        vec![
-            "name",
-            "displayName",
-            "regionId",
-            "regionDisplayName",
-            "state",
-            "minRcu",
-            "maxRcu",
-            "servicePlan",
-            "cloudProvider",
-            "highAvailabilityType",
-            "rootPassword",
-            "annotations",
-            "labels",
-            "creator",
-            "createTime",
-            "updateTime",
-            "endpoints",
-            "tidbId",
-        ]
+        crate::tidb_cloud::models::Tidb::field_names().to_vec()
+    }
+
+    /// Get the list of valid fields for backup objects
+    fn get_valid_backup_fields() -> Vec<&'static str> {
+        crate::tidb_cloud::models::Backup::field_names().to_vec()
     }
 
     /// Transform CREATE command
@@ -590,6 +897,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_select_backups_all() {
+        let result = SQLDSLParser::parse("SELECT * FROM BACKUPS WHERE displayName = 'my-cluster'");
+        assert!(result.is_ok());
+        let command = result.unwrap();
+        assert_eq!(command.command_type, DSLCommandType::ListBackups);
+    }
+
+    #[test]
+    fn test_parse_select_backups_specific_fields() {
+        let result = SQLDSLParser::parse(
+            "SELECT id, displayName FROM BACKUPS WHERE displayName = 'my-cluster'",
+        );
+        assert!(result.is_ok());
+        let command = result.unwrap();
+        assert_eq!(command.command_type, DSLCommandType::ListBackups);
+    }
+
+    #[test]
+    fn test_parse_select_backups_with_where() {
+        let result = SQLDSLParser::parse(
+            "SELECT * FROM BACKUPS WHERE displayName = 'my-cluster' AND state = 'succeeded'",
+        );
+        assert!(result.is_ok());
+        let command = result.unwrap();
+        assert_eq!(command.command_type, DSLCommandType::ListBackups);
+    }
+
+    #[test]
     fn test_transform_select_invalid_field() {
         let result = SQLDSLParser::transform_select("SELECT n FROM CLUSTER");
         assert!(result.is_err());
@@ -634,5 +969,125 @@ mod tests {
         let result = SQLDSLParser::transform_select("SELECT * FROM CLUSTER");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "LIST CLUSTERS");
+    }
+
+    #[test]
+    fn test_transform_select_backups_all() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT * FROM BACKUPS WHERE displayName = 'my-cluster'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WHERE displayName = 'my-cluster'"
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_specific_fields() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT id, displayName, state FROM BACKUPS WHERE displayName = 'my-cluster'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WHERE displayName = 'my-cluster' WITH selected_fields = \"id,displayName,state\""
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_with_where() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT * FROM BACKUPS WHERE displayName = 'my-cluster' AND state = 'succeeded'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WHERE displayName = 'my-cluster' WHERE state = 'succeeded'"
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_with_where_and_fields() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT id, displayName FROM BACKUPS WHERE displayName = 'my-cluster' AND state = 'succeeded'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WHERE displayName = 'my-cluster' WITH selected_fields = \"id,displayName\" WHERE state = 'succeeded'"
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_invalid_field() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT invalid_field FROM BACKUPS WHERE displayName = 'my-cluster'",
+        );
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Invalid field 'invalid_field'"));
+    }
+
+    #[test]
+    fn test_transform_select_backups_missing_where() {
+        let result = SQLDSLParser::transform_select("SELECT * FROM BACKUPS my-cluster");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected WHERE after FROM BACKUPS")
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_all_clusters() {
+        let result = SQLDSLParser::transform_select("SELECT * FROM BACKUPS");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "LIST BACKUPS");
+    }
+
+    #[test]
+    fn test_transform_select_backups_all_clusters_with_fields() {
+        let result = SQLDSLParser::transform_select("SELECT id, displayName FROM BACKUPS");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WITH selected_fields = \"id,displayName\""
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_missing_tidbid() {
+        let result = SQLDSLParser::transform_select("SELECT * FROM BACKUPS WHERE");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Expected condition after WHERE"));
+    }
+
+    #[test]
+    fn test_transform_select_backups_missing_tidbid_pattern() {
+        let result =
+            SQLDSLParser::transform_select("SELECT * FROM BACKUPS WHERE state = 'succeeded'");
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected 'displayName = <cluster-pattern>' in WHERE clause")
+        );
+    }
+
+    #[test]
+    fn test_transform_select_backups_with_complex_where() {
+        let result = SQLDSLParser::transform_select(
+            "SELECT id, displayName FROM BACKUPS WHERE displayName = 'my-cluster' AND state = 'succeeded' AND displayName LIKE 'backup-%'",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "LIST BACKUPS WHERE displayName = 'my-cluster' WITH selected_fields = \"id,displayName\" WHERE state = 'succeeded' AND displayName LIKE 'backup-%'"
+        );
     }
 }

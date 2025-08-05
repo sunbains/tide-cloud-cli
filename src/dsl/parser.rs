@@ -702,11 +702,19 @@ impl DSLParser {
     fn parse_list_backups(&mut self) -> DSLResult<DSLCommand> {
         self.consume(DSLTokenType::Backups, "Expected 'BACKUPS'")?;
 
-        self.consume(DSLTokenType::For, "Expected 'FOR'")?;
-        let cluster_name = self.parse_identifier()?;
+        let mut command = DSLCommand::new(DSLCommandType::ListBackups);
 
-        Ok(DSLCommand::new(DSLCommandType::ListBackups)
-            .with_parameter("cluster_name", DSLValue::from(cluster_name)))
+        // Check if there's a FOR clause
+        if self.match_token(DSLTokenType::For) {
+            let cluster_name = self.parse_identifier()?;
+            command = command.with_parameter("cluster_name", DSLValue::from(cluster_name));
+        }
+
+        if self.match_token(DSLTokenType::With) {
+            command = self.parse_with_clause(command)?;
+        }
+
+        Ok(command)
     }
 
     fn parse_get_command(&mut self) -> DSLResult<DSLCommand> {

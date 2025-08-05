@@ -1,3 +1,4 @@
+use field_names_macro::FieldNames;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -133,7 +134,7 @@ pub enum ComponentType {
 // ============================================================================
 
 /// TiDB cluster information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FieldNames)]
 #[serde(rename_all = "camelCase")]
 pub struct Tidb {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,7 +208,7 @@ pub struct TidbEndpoint {
 }
 
 /// Backup information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FieldNames)]
 #[serde(rename_all = "camelCase")]
 pub struct Backup {
     #[serde(skip_serializing_if = "Option::is_none")]

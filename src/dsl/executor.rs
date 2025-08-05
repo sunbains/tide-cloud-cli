@@ -941,41 +941,108 @@ impl DSLExecutor {
     }
 
     async fn execute_list_backups(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let cluster_name = command.get_parameter_as_string("cluster_name")?;
+        // Check if field selection is requested
+        let selected_fields = command
+            .get_optional_parameter("selected_fields")
+            .and_then(|v| v.as_string())
+            .map(|s| {
+                s.split(',')
+                    .map(|f| f.trim().to_string())
+                    .collect::<Vec<_>>()
+            });
 
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
+        // Check if a specific cluster is requested
+        if let Ok(cluster_name) = command.get_parameter_as_string("cluster_name") {
+            // List backups for a specific cluster
+            let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
+                DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
+            })?;
 
-        let cluster = clusters
-            .iter()
-            .find(|c| c.display_name == cluster_name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{cluster_name}'")))?;
+            let cluster = clusters
+                .iter()
+                .find(|c| c.display_name == cluster_name)
+                .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{cluster_name}'")))?;
 
-        let cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
+            let cluster_id = cluster
+                .tidb_id
+                .as_ref()
+                .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
 
-        match self.client.list_all_backups(cluster_id, None).await {
-            Ok(backups) => {
-                let backups_len = backups.len();
-                let backups_data = DSLValue::Array(
-                    backups
-                        .into_iter()
-                        .map(|b| self.backup_to_dsl_value(b))
-                        .collect(),
-                );
-                Ok(CommandResult::success_with_data_and_message(
-                    backups_data,
-                    format!("Found {backups_len} backups for cluster '{cluster_name}'"),
-                ))
+            match self.client.list_all_backups(cluster_id, None).await {
+                Ok(backups) => {
+                    let backups_len = backups.len();
+
+                    let backups_data = if let Some(fields) = &selected_fields {
+                        DSLValue::Array(
+                            backups
+                                .into_iter()
+                                .map(|b| self.backup_to_dsl_value_filtered(&b, fields))
+                                .collect(),
+                        )
+                    } else {
+                        DSLValue::Array(
+                            backups
+                                .into_iter()
+                                .map(|b| self.backup_to_dsl_value(b))
+                                .collect(),
+                        )
+                    };
+
+                    Ok(CommandResult::success_with_data_and_message(
+                        backups_data,
+                        format!("Found {backups_len} backups for cluster '{cluster_name}'"),
+                    ))
+                }
+                Err(e) => Err(DSLError::execution_error_with_source(
+                    format!("Failed to list backups for cluster '{cluster_name}'"),
+                    e.to_string(),
+                )),
             }
-            Err(e) => Err(DSLError::execution_error_with_source(
-                format!("Failed to list backups for cluster '{cluster_name}'"),
-                e.to_string(),
-            )),
+        } else {
+            // List backups from all clusters
+            let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
+                DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
+            })?;
+
+            let mut all_backups = Vec::new();
+            let mut total_backups = 0;
+            let mut cluster_count = 0;
+
+            for cluster in clusters {
+                if let Some(cluster_id) = &cluster.tidb_id {
+                    match self.client.list_all_backups(cluster_id, None).await {
+                        Ok(backups) => {
+                            total_backups += backups.len();
+                            cluster_count += 1;
+
+                            if let Some(fields) = &selected_fields {
+                                all_backups.extend(
+                                    backups
+                                        .into_iter()
+                                        .map(|b| self.backup_to_dsl_value_filtered(&b, fields)),
+                                );
+                            } else {
+                                all_backups.extend(
+                                    backups.into_iter().map(|b| self.backup_to_dsl_value(b)),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to list backups for cluster '{}': {}",
+                                cluster.display_name,
+                                e
+                            );
+                            // Continue with other clusters
+                        }
+                    }
+                }
+            }
+
+            Ok(CommandResult::success_with_data_and_message(
+                DSLValue::Array(all_backups),
+                format!("Found {total_backups} backups across {cluster_count} clusters"),
+            ))
         }
     }
 
@@ -1271,6 +1338,25 @@ impl DSLExecutor {
         }
     }
 
+    fn json_value_to_dsl_value_filtered(
+        value: serde_json::Value,
+        selected_fields: &[String],
+    ) -> DSLValue {
+        match value {
+            serde_json::Value::Object(obj) => {
+                let mut filtered_obj = HashMap::new();
+                for field in selected_fields {
+                    if let Some(value) = obj.get(field) {
+                        filtered_obj
+                            .insert(field.clone(), Self::json_value_to_dsl_value(value.clone()));
+                    }
+                }
+                DSLValue::Object(filtered_obj)
+            }
+            _ => Self::json_value_to_dsl_value(value),
+        }
+    }
+
     /// Convert cluster to DSLValue with only selected fields
     fn cluster_to_dsl_value_filtered(
         &self,
@@ -1379,6 +1465,29 @@ impl DSLExecutor {
             Ok(json_value) => {
                 // Convert serde_json::Value to DSLValue
                 Self::json_value_to_dsl_value(json_value)
+            }
+            Err(_) => {
+                // Fallback to a basic object if serialization fails
+                let mut obj = HashMap::new();
+                obj.insert(
+                    "error".to_string(),
+                    DSLValue::from("Failed to serialize backup"),
+                );
+                DSLValue::Object(obj)
+            }
+        }
+    }
+
+    fn backup_to_dsl_value_filtered(
+        &self,
+        backup: &Backup,
+        selected_fields: &[String],
+    ) -> DSLValue {
+        // Use serde_json to serialize the backup to JSON, then convert to DSLValue with field filtering
+        match serde_json::to_value(backup) {
+            Ok(json_value) => {
+                // Convert serde_json::Value to DSLValue with field filtering
+                Self::json_value_to_dsl_value_filtered(json_value, selected_fields)
             }
             Err(_) => {
                 // Fallback to a basic object if serialization fails
@@ -2107,10 +2216,11 @@ impl DSLExecutor {
                     let mut max_width = key.len();
                     for item in arr {
                         if let DSLValue::Object(obj) = item
-                            && let Some(value) = obj.get(key) {
-                                let value_str = self.format_value_for_table(value);
-                                max_width = max_width.max(value_str.len());
-                            }
+                            && let Some(value) = obj.get(key)
+                        {
+                            let value_str = self.format_value_for_table(value);
+                            max_width = max_width.max(value_str.len());
+                        }
                     }
                     column_widths.insert(key.clone(), max_width);
                 }
@@ -2329,26 +2439,27 @@ impl DSLExecutor {
             let mut max_width = key.len();
             for item in arr {
                 if let DSLValue::Object(obj) = item
-                    && let Some(value) = obj.get(key) {
-                        let value_str = match value {
-                            DSLValue::Array(arr) => {
-                                if arr.is_empty() {
-                                    "[]".to_string()
-                                } else {
-                                    self.create_compact_sub_table_for_array(arr)
-                                }
+                    && let Some(value) = obj.get(key)
+                {
+                    let value_str = match value {
+                        DSLValue::Array(arr) => {
+                            if arr.is_empty() {
+                                "[]".to_string()
+                            } else {
+                                self.create_compact_sub_table_for_array(arr)
                             }
-                            DSLValue::Object(obj) => {
-                                if obj.is_empty() {
-                                    "{}".to_string()
-                                } else {
-                                    self.create_compact_sub_table_for_object(obj)
-                                }
+                        }
+                        DSLValue::Object(obj) => {
+                            if obj.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                self.create_compact_sub_table_for_object(obj)
                             }
-                            _ => format!("{value}"),
-                        };
-                        max_width = max_width.max(value_str.len());
-                    }
+                        }
+                        _ => format!("{value}"),
+                    };
+                    max_width = max_width.max(value_str.len());
+                }
             }
             column_widths.push(max_width + 2); // Add padding
         }
@@ -2648,9 +2759,7 @@ impl DSLExecutor {
                 line
             };
 
-            result.push_str(&format!(
-                " {truncated_line:<column_width$} "
-            ));
+            result.push_str(&format!(" {truncated_line:<column_width$} "));
             if i < lines.len() - 1 {
                 result.push_str("│\n");
             }
@@ -2668,10 +2777,11 @@ impl DSLExecutor {
             let mut max_width = key.len();
             for item in arr {
                 if let DSLValue::Object(obj) = item
-                    && let Some(value) = obj.get(key) {
-                        let value_str = self.format_value_for_table(value);
-                        max_width = max_width.max(value_str.len());
-                    }
+                    && let Some(value) = obj.get(key)
+                {
+                    let value_str = self.format_value_for_table(value);
+                    max_width = max_width.max(value_str.len());
+                }
             }
             column_widths.insert(key.clone(), max_width);
         }
