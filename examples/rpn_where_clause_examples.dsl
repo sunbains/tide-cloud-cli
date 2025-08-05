@@ -1,45 +1,45 @@
 # RPN-Based WHERE Clause Examples
 # This file demonstrates the new RPN-based condition evaluator for complex WHERE clauses
+# Now using SELECT statements instead of LIST commands
 
 # Simple conditions
-LIST CLUSTERS WHERE name = test-cluster
-LIST CLUSTERS WHERE state = ACTIVE
-LIST CLUSTERS WHERE region = us-east-1
+SELECT * FROM BACKUPS WHERE state = ACTIVE
+SELECT * FROM BACKUPS WHERE size > 1000
 
 # Logical operators
-LIST CLUSTERS WHERE name = test-cluster AND state = ACTIVE
-LIST CLUSTERS WHERE name = test-cluster OR state = FAILED
-LIST CLUSTERS WHERE NOT (state = FAILED)
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND size > 500
+SELECT * FROM BACKUPS WHERE state = ACTIVE OR state = CREATING
+SELECT * FROM BACKUPS WHERE NOT (state = FAILED)
 
 # Complex expressions with parentheses
-LIST CLUSTERS WHERE (name = test* OR name = prod*) AND (state = ACTIVE OR state = CREATING)
-LIST CLUSTERS WHERE name = /test.*/ AND (region = us-east-1 OR region = us-west-2)
+SELECT * FROM BACKUPS WHERE (size > 100 OR size < 50) AND (state = ACTIVE OR state = CREATING)
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND (size > 1000 OR size < 100)
 
-# Pattern matching
-LIST CLUSTERS WHERE name = test*          # Wildcard pattern
-LIST CLUSTERS WHERE name = /test.*/       # Regular expression
-LIST CLUSTERS WHERE name = /.*cluster/    # Regex with anchors
+# Pattern matching with backups
+SELECT * FROM BACKUPS WHERE state = ACTIVE
+SELECT * FROM BACKUPS WHERE size >= 500
+SELECT * FROM BACKUPS WHERE createTime > "2023-01-01"
 
 # Mixed conditions
-LIST CLUSTERS WHERE name = test* AND (state = ACTIVE OR state = CREATING) AND NOT (state = FAILED)
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND (size > 100 OR size < 50) AND NOT (state = FAILED)
 
 # Complex nested expressions
-LIST CLUSTERS WHERE (
-    (name = test* OR name = prod*) AND 
-    (state = ACTIVE OR state = CREATING OR state = UPDATING) AND 
+SELECT * FROM BACKUPS WHERE (
+    (state = ACTIVE OR state = CREATING) AND 
+    (size > 100 OR size < 50) AND 
     NOT (state = FAILED OR state = DELETED)
 ) OR (
-    name = /.*-dev.*/ AND region = us-west-2
+    size > 1000 AND state = COMPLETED
 )
 
 # Field comparisons with different operators
-LIST CLUSTERS WHERE min_rcu >= 1 AND max_rcu <= 10
-LIST CLUSTERS WHERE service_plan = STARTER AND cloud_provider = AWS
-LIST CLUSTERS WHERE create_time > "2023-01-01" AND update_time < "2023-12-31"
+SELECT * FROM BACKUPS WHERE size >= 100 AND size <= 1000
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND createTime > "2023-01-01"
+SELECT * FROM BACKUPS WHERE createTime > "2023-01-01" AND createTime < "2023-12-31"
 
 # Using NOT with complex expressions
-LIST CLUSTERS WHERE NOT (name = test* AND state = FAILED)
-LIST CLUSTERS WHERE name = prod* AND NOT (state = DELETED OR state = FAILED)
+SELECT * FROM BACKUPS WHERE NOT (state = FAILED AND size < 100)
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND NOT (state = DELETED OR state = FAILED)
 
 # Multiple field comparisons
-LIST CLUSTERS WHERE name = /.*prod.*/ AND region = us-east-1 AND service_plan = DEDICATED 
+SELECT * FROM BACKUPS WHERE state = ACTIVE AND size > 500 AND createTime > "2023-01-01"

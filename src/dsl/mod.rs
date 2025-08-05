@@ -16,7 +16,7 @@
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use tidb_cli::dsl::{DSLParser, DSLExecutor, DSLCommand};
+//! use tidb_cli::dsl::{UnifiedParser, DSLExecutor};
 //! use tidb_cli::tidb_cloud::TiDBCloudClient;
 //!
 //! #[tokio::main]
@@ -25,34 +25,45 @@
 //!     let client = TiDBCloudClient::new(api_key)?;
 //!     let mut executor = DSLExecutor::new(client);
 //!     
-//!     // Parse and execute a single command
-//!     let command = DSLParser::parse("CREATE CLUSTER my-cluster IN aws-us-west-1")?;
-//!     let result = executor.execute(command).await?;
+//!     // Parse and execute a single command using AST
+//!     let ast = UnifiedParser::parse("CREATE CLUSTER my-cluster IN aws-us-west-1")?;
+//!     let result = executor.execute_ast(&ast).await?;
 //!     
-//!     // Parse and execute a script
+//!     // Parse and execute a script using AST
 //!     let script = r#"
 //!         CREATE CLUSTER test-cluster IN aws-us-west-1 WITH min_rcu=1, max_rcu=10
 //!         WAIT FOR test-cluster TO BE ACTIVE
 //!         CREATE BACKUP FOR test-cluster
 //!     "#;
-//!     let commands = DSLParser::parse_script(script)?;
-//!     let results = executor.execute_batch(commands).await?;
+//!     let batch_result = executor.execute_ast_script(script).await?;
 //!     
 //!     Ok(())
 //! }
 //! ```
 
+pub mod ast;
+pub mod ast_dsl_transformer;
 pub mod commands;
+pub mod dsl_ast_parser;
 pub mod error;
 pub mod executor;
-pub mod parser;
-pub mod sql_parser;
+pub mod sql_ast_parser;
 pub mod syntax;
+pub mod unified_parser;
 
+#[cfg(test)]
+mod join_test;
+
+pub use ast::{ASTNode, ASTPrinter, ASTTransformer, ASTValidator, ASTVisitor};
+pub use ast_dsl_transformer::ASTDSLTransformer;
 pub use commands::{DSLCommand, DSLCommandFactory, DSLResult};
+pub use dsl_ast_parser::DSLASTParser;
 pub use error::{DSLError, DSLResult as Result};
 pub use executor::DSLExecutor;
-pub use parser::DSLParser;
-pub use sql_parser::SQLDSLParser;
+// Old parsers removed - using new AST-based system instead
+// pub use parser::DSLParser;
+pub use sql_ast_parser::SQLASTParser;
+// pub use sql_parser::SQLDSLParser;
 pub use syntax::DSLValue;
 pub use syntax::{DSLSyntaxTree, DSLToken, DSLTokenType};
+pub use unified_parser::UnifiedParser;

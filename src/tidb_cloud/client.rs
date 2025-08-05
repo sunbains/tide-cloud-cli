@@ -249,7 +249,7 @@ mod tests {
         let client =
             TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string())
                 .unwrap();
-        let debug_str = format!("{:?}", client);
+        let debug_str = format!("{client:?}");
         assert!(debug_str.contains("TiDBCloudClient"));
         assert!(debug_str.contains("***")); // API key should be masked
     }

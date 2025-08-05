@@ -241,7 +241,6 @@ impl TiDBCloudClient {
                 break;
             }
         }
-
         Ok(all_tidbs)
     }
 
@@ -358,7 +357,7 @@ mod tests {
         };
 
         let query = client.build_query_string(&params).unwrap();
-        println!("Generated query: {}", query);
+        println!("Generated query: {query}");
         assert!(query.contains("servicePlan=Starter"));
         assert!(query.contains("name=test-cluster"));
         assert!(query.contains("pageSize=10"));

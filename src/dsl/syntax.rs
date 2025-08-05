@@ -6,8 +6,6 @@ pub enum DSLTokenType {
     // Keywords
     Create,
     Delete,
-    List,
-    Get,
     Update,
     Wait,
     For,
@@ -122,8 +120,6 @@ impl fmt::Display for DSLTokenType {
         match self {
             DSLTokenType::Create => write!(f, "CREATE"),
             DSLTokenType::Delete => write!(f, "DELETE"),
-            DSLTokenType::List => write!(f, "LIST"),
-            DSLTokenType::Get => write!(f, "GET"),
             DSLTokenType::Update => write!(f, "UPDATE"),
             DSLTokenType::Wait => write!(f, "WAIT"),
             DSLTokenType::For => write!(f, "FOR"),
@@ -254,8 +250,6 @@ impl DSLToken {
             self.token_type,
             DSLTokenType::Create
                 | DSLTokenType::Delete
-                | DSLTokenType::List
-                | DSLTokenType::Get
                 | DSLTokenType::Update
                 | DSLTokenType::Wait
                 | DSLTokenType::For
@@ -391,12 +385,6 @@ pub enum DSLSyntaxTree {
         password: Option<String>,
     },
     DeleteCluster {
-        name: String,
-    },
-    ListClusters {
-        filters: Vec<ClusterFilter>,
-    },
-    GetCluster {
         name: String,
     },
     UpdateCluster {

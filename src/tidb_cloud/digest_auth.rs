@@ -670,10 +670,10 @@ mod tests {
 
         // Step 3: Verify the Authorization header format
         assert!(auth_header.starts_with("Digest algorithm=MD5"));
-        assert!(auth_header.contains(&format!("username=\"{}\"", username)));
+        assert!(auth_header.contains(&format!("username=\"{username}\"")));
         assert!(auth_header.contains("realm=\"tidb.cloud\""));
         assert!(auth_header.contains("nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\""));
-        assert!(auth_header.contains(&format!("uri=\"{}\"", uri)));
+        assert!(auth_header.contains(&format!("uri=\"{uri}\"")));
         assert!(auth_header.contains("qop=auth"));
         assert!(auth_header.contains("nc=00000001"));
         assert!(auth_header.contains("cnonce=\""));
@@ -682,10 +682,10 @@ mod tests {
         // Verify the header structure (all required components are present)
         let components = [
             "Digest algorithm=MD5",
-            &format!("username=\"{}\"", username),
+            &format!("username=\"{username}\""),
             "realm=\"tidb.cloud\"",
             "nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\"",
-            &format!("uri=\"{}\"", uri),
+            &format!("uri=\"{uri}\""),
             "qop=auth",
             "nc=00000001",
             "cnonce=\"",
@@ -695,8 +695,7 @@ mod tests {
         for component in &components {
             assert!(
                 auth_header.contains(component),
-                "Authorization header missing component: {}",
-                component
+                "Authorization header missing component: {component}"
             );
         }
 
@@ -715,10 +714,10 @@ mod tests {
 
         // Step 5: Verify the response format is consistent
         assert!(auth_header2.starts_with("Digest algorithm=MD5"));
-        assert!(auth_header2.contains(&format!("username=\"{}\"", username)));
+        assert!(auth_header2.contains(&format!("username=\"{username}\"")));
         assert!(auth_header2.contains("realm=\"tidb.cloud\""));
         assert!(auth_header2.contains("nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\""));
-        assert!(auth_header2.contains(&format!("uri=\"{}\"", uri)));
+        assert!(auth_header2.contains(&format!("uri=\"{uri}\"")));
         assert!(auth_header2.contains("qop=auth"));
         assert!(auth_header2.contains("nc=00000002"));
         assert!(auth_header2.contains("cnonce=\""));
@@ -754,11 +753,11 @@ mod tests {
 
         // Step 3: Verify the Authorization header includes opaque
         assert!(auth_header.starts_with("Digest algorithm=MD5"));
-        assert!(auth_header.contains(&format!("username=\"{}\"", username)));
+        assert!(auth_header.contains(&format!("username=\"{username}\"")));
         assert!(auth_header.contains("realm=\"test-realm\""));
         assert!(auth_header.contains("nonce=\"test-nonce-123\""));
         assert!(auth_header.contains("opaque=\"test-opaque-456\""));
-        assert!(auth_header.contains(&format!("uri=\"{}\"", uri)));
+        assert!(auth_header.contains(&format!("uri=\"{uri}\"")));
         assert!(auth_header.contains("qop=auth"));
         assert!(auth_header.contains("nc=00000001"));
         assert!(auth_header.contains("cnonce=\""));
@@ -802,10 +801,10 @@ mod tests {
 
         // Step 3: Verify the Authorization header format (without qop-related fields)
         assert!(auth_header.starts_with("Digest algorithm=MD5"));
-        assert!(auth_header.contains(&format!("username=\"{}\"", username)));
+        assert!(auth_header.contains(&format!("username=\"{username}\"")));
         assert!(auth_header.contains("realm=\"simple-realm\""));
         assert!(auth_header.contains("nonce=\"simple-nonce-789\""));
-        assert!(auth_header.contains(&format!("uri=\"{}\"", uri)));
+        assert!(auth_header.contains(&format!("uri=\"{uri}\"")));
         assert!(auth_header.contains("response=\""));
 
         // Verify qop-related fields are NOT present
@@ -816,18 +815,17 @@ mod tests {
         // Verify the response format is simpler
         let components = [
             "Digest algorithm=MD5",
-            &format!("username=\"{}\"", username),
+            &format!("username=\"{username}\""),
             "realm=\"simple-realm\"",
             "nonce=\"simple-nonce-789\"",
-            &format!("uri=\"{}\"", uri),
+            &format!("uri=\"{uri}\""),
             "response=\"",
         ];
 
         for component in &components {
             assert!(
                 auth_header.contains(component),
-                "Authorization header missing component: {}",
-                component
+                "Authorization header missing component: {component}"
             );
         }
     }
@@ -866,8 +864,7 @@ mod tests {
         );
         assert!(
             response_hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "Response hash should contain only hex characters: {}",
-            response_hash
+            "Response hash should contain only hex characters: {response_hash}"
         );
 
         // Extract cnonce for verification
@@ -878,8 +875,7 @@ mod tests {
         // Verify cnonce is a valid hex string
         assert!(
             cnonce.chars().all(|c| c.is_ascii_hexdigit()),
-            "Cnonce should contain only hex characters: {}",
-            cnonce
+            "Cnonce should contain only hex characters: {cnonce}"
         );
 
         // Manually calculate the expected response hash to verify correctness
@@ -888,7 +884,7 @@ mod tests {
         let ha1 = auth.md5_hash(&ha1_input);
 
         // HA2 = MD5(method:uri)
-        let ha2_input = format!("{}:{}", method, uri);
+        let ha2_input = format!("{method}:{uri}");
         let ha2 = auth.md5_hash(&ha2_input);
 
         // Response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
@@ -901,8 +897,7 @@ mod tests {
         // Verify the calculated response matches the generated one
         assert_eq!(
             response_hash, expected_response,
-            "Response hash calculation is incorrect. Expected: {}, Got: {}",
-            expected_response, response_hash
+            "Response hash calculation is incorrect. Expected: {expected_response}, Got: {response_hash}"
         );
 
         // Verify the nonce counter was incremented
@@ -932,17 +927,14 @@ mod tests {
 
         // CRITICAL: Verify the username is correctly included in the Authorization header
         assert!(
-            auth_header.contains(&format!("username=\"{}\"", username)),
-            "Authorization header must contain the correct username. Expected: username=\"{}\", Got: {}",
-            username,
-            auth_header
+            auth_header.contains(&format!("username=\"{username}\"")),
+            "Authorization header must contain the correct username. Expected: username=\"{username}\", Got: {auth_header}"
         );
 
         // Verify it does NOT contain the hardcoded username that was causing the bug
         assert!(
             !auth_header.contains("username=\"tidb_cloud_user\""),
-            "Authorization header should not contain hardcoded username 'tidb_cloud_user'. Got: {}",
-            auth_header
+            "Authorization header should not contain hardcoded username 'tidb_cloud_user'. Got: {auth_header}"
         );
 
         // Verify other required fields are present
@@ -983,14 +975,12 @@ mod tests {
 
         // Verify both headers contain their respective usernames
         assert!(
-            header1.contains(&format!("username=\"{}\"", username1)),
-            "Header1 should contain username1. Got: {}",
-            header1
+            header1.contains(&format!("username=\"{username1}\"")),
+            "Header1 should contain username1. Got: {header1}"
         );
         assert!(
-            header2.contains(&format!("username=\"{}\"", username2)),
-            "Header2 should contain username2. Got: {}",
-            header2
+            header2.contains(&format!("username=\"{username2}\"")),
+            "Header2 should contain username2. Got: {header2}"
         );
 
         // Verify the headers are different (they should be due to different usernames and passwords)
@@ -1022,10 +1012,8 @@ mod tests {
 
         // Verify the username is correctly included
         assert!(
-            auth_header.contains(&format!("username=\"{}\"", username)),
-            "Real-world scenario: Authorization header must contain correct username. Expected: username=\"{}\", Got: {}",
-            username,
-            auth_header
+            auth_header.contains(&format!("username=\"{username}\"")),
+            "Real-world scenario: Authorization header must contain correct username. Expected: username=\"{username}\", Got: {auth_header}"
         );
 
         // Verify the header format matches what we expect from the real logs
@@ -1063,10 +1051,8 @@ mod tests {
         // The username should be escaped as: user\"with\"quotes -> user\\\"with\\\"quotes
         let expected_escaped = "user\\\"with\\\"quotes";
         assert!(
-            auth_header.contains(&format!("username=\"{}\"", expected_escaped)),
-            "Username with quotes should be properly escaped. Expected: username=\"{}\", Got: {}",
-            expected_escaped,
-            auth_header
+            auth_header.contains(&format!("username=\"{expected_escaped}\"")),
+            "Username with quotes should be properly escaped. Expected: username=\"{expected_escaped}\", Got: {auth_header}"
         );
     }
 
@@ -1086,17 +1072,14 @@ mod tests {
 
         // Verify the username is correctly included
         assert!(
-            auth_header.contains(&format!("username=\"{}\"", username)),
-            "Authenticate method must preserve username. Expected: username=\"{}\", Got: {}",
-            username,
-            auth_header
+            auth_header.contains(&format!("username=\"{username}\"")),
+            "Authenticate method must preserve username. Expected: username=\"{username}\", Got: {auth_header}"
         );
 
         // Verify it does NOT contain the hardcoded username
         assert!(
             !auth_header.contains("username=\"tidb_cloud_user\""),
-            "Authenticate method should not use hardcoded username. Got: {}",
-            auth_header
+            "Authenticate method should not use hardcoded username. Got: {auth_header}"
         );
     }
 
@@ -1140,13 +1123,12 @@ mod tests {
         // Verify the response hashes are different (due to different passwords)
         assert_ne!(
             response1_hash, response2_hash,
-            "Response hashes should be different for different passwords. Got: {} for both",
-            response1_hash
+            "Response hashes should be different for different passwords. Got: {response1_hash} for both"
         );
 
         // Verify both headers contain the same username
-        assert!(header1.contains(&format!("username=\"{}\"", username)));
-        assert!(header2.contains(&format!("username=\"{}\"", username)));
+        assert!(header1.contains(&format!("username=\"{username}\"")));
+        assert!(header2.contains(&format!("username=\"{username}\"")));
     }
 
     #[test]
@@ -1185,7 +1167,7 @@ mod tests {
         let ha1 = auth.md5_hash(&ha1_input);
 
         // HA2 = MD5(method:uri)
-        let ha2_input = format!("{}:{}", method, uri);
+        let ha2_input = format!("{method}:{uri}");
         let ha2 = auth.md5_hash(&ha2_input);
 
         // Response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
@@ -1198,8 +1180,7 @@ mod tests {
         // Verify the calculated response matches the generated one
         assert_eq!(
             response_hash, expected_response,
-            "Password calculation verification failed. Expected: {}, Got: {}",
-            expected_response, response_hash
+            "Password calculation verification failed. Expected: {expected_response}, Got: {response_hash}"
         );
 
         // Verify that changing the password would change the result
@@ -1251,15 +1232,14 @@ mod tests {
         );
         assert!(
             response_hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "Response hash should contain only hex characters: {}",
-            response_hash
+            "Response hash should contain only hex characters: {response_hash}"
         );
 
         // Manually calculate the expected response hash with the real password
         let ha1_input = format!("{}:{}:{}", username, "tidb.cloud", password);
         let ha1 = auth.md5_hash(&ha1_input);
 
-        let ha2_input = format!("{}:{}", method, uri);
+        let ha2_input = format!("{method}:{uri}");
         let ha2 = auth.md5_hash(&ha2_input);
 
         // Extract cnonce for verification
@@ -1276,8 +1256,7 @@ mod tests {
         // Verify the calculated response matches the generated one
         assert_eq!(
             response_hash, expected_response,
-            "Real-world password scenario: Response hash calculation failed. Expected: {}, Got: {}",
-            expected_response, response_hash
+            "Real-world password scenario: Response hash calculation failed. Expected: {expected_response}, Got: {response_hash}"
         );
 
         // Verify that using a wrong password would produce a different result
@@ -1324,7 +1303,7 @@ mod tests {
         let ha1_input = format!("{}:{}:{}", username, "test-realm", password);
         let ha1 = auth.md5_hash(&ha1_input);
 
-        let ha2_input = format!("{}:{}", method, uri);
+        let ha2_input = format!("{method}:{uri}");
         let ha2 = auth.md5_hash(&ha2_input);
 
         // Extract cnonce for verification
@@ -1341,8 +1320,7 @@ mod tests {
         // Verify the calculated response matches the generated one
         assert_eq!(
             response_hash, expected_response,
-            "Password with special characters: Response hash calculation failed. Expected: {}, Got: {}",
-            expected_response, response_hash
+            "Password with special characters: Response hash calculation failed. Expected: {expected_response}, Got: {response_hash}"
         );
     }
 }

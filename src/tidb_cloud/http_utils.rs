@@ -955,7 +955,7 @@ mod tests {
         // Valid URLs
         assert!(
             builder
-                .validate_url(&format!("{}/tidbs", PRODUCTION_API_URL))
+                .validate_url(&format!("{PRODUCTION_API_URL}/tidbs"))
                 .is_ok()
         );
         assert!(

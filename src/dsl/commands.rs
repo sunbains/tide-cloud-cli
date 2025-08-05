@@ -16,16 +16,18 @@ pub enum DSLCommandType {
     // Cluster management
     CreateCluster,
     DeleteCluster,
-    ListClusters,
-    GetCluster,
     UpdateCluster,
     WaitForCluster,
+    ListClusters,
 
     // Backup management
     CreateBackup,
     ListBackups,
     DeleteBackup,
     RestoreBackup,
+
+    // Query operations
+    Join,
 
     // Pricing
     EstimatePrice,
@@ -387,15 +389,6 @@ impl DSLCommandFactory {
             .with_parameter("name", DSLValue::from(name.into()))
     }
 
-    pub fn list_clusters() -> DSLCommand {
-        DSLCommand::new(DSLCommandType::ListClusters)
-    }
-
-    pub fn get_cluster(name: impl Into<String>) -> DSLCommand {
-        DSLCommand::new(DSLCommandType::GetCluster)
-            .with_parameter("name", DSLValue::from(name.into()))
-    }
-
     pub fn wait_for_cluster(name: impl Into<String>, state: impl Into<String>) -> DSLCommand {
         DSLCommand::new(DSLCommandType::WaitForCluster)
             .with_parameter("name", DSLValue::from(name.into()))
@@ -653,13 +646,6 @@ mod tests {
             command.get_parameter_as_string("name").unwrap(),
             "test-cluster"
         );
-    }
-
-    #[test]
-    fn test_dsl_command_factory_list_clusters() {
-        let command = DSLCommandFactory::list_clusters();
-        assert_eq!(command.command_type, DSLCommandType::ListClusters);
-        assert!(command.parameters.is_empty());
     }
 
     #[test]
