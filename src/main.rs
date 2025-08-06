@@ -8,13 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tidb_cli::{
-    dsl::{DSLCommand, DSLExecutor, UnifiedParser},
+    dsl::{DSLExecutor, UnifiedParser},
     logging::{LogConfig, init_logging},
     tidb_cloud::{DebugLogger, TiDBCloudClient, constants::VerbosityLevel},
 };
 
-#[cfg(test)]
-use tidb_cli::dsl::commands::DSLCommandType;
 use tokio::signal;
 use tracing::Level;
 
@@ -56,7 +54,7 @@ struct Cli {
     timeout: u64,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -72,9 +70,6 @@ enum Commands {
         /// Path to the DSL script file
         file: String,
     },
-
-    /// Execute DSL commands interactively
-    Interactive,
 
     /// Validate a DSL script without executing it
     Validate {
@@ -134,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if we need authentication for the command
     let needs_auth = matches!(
         cli.command,
-        Commands::Exec { .. } | Commands::Script { .. } | Commands::Interactive
+        Some(Commands::Exec { .. }) | Some(Commands::Script { .. }) | None
     );
 
     let mut executor = if needs_auth {
@@ -197,41 +192,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     match cli.command {
-        Commands::Exec { command } => {
+        Some(Commands::Exec { command }) => {
             // Split command by semicolons to handle multiple commands
             let commands = split_commands(&command);
             execute_multiple_commands(executor.as_mut().unwrap(), &commands).await?;
         }
 
-        Commands::Script { file } => {
+        Some(Commands::Script { file }) => {
             execute_script_file(executor.as_mut().unwrap(), &file).await?;
         }
 
-        Commands::Interactive => {
+        None => {
             run_interactive_mode(executor.as_mut().unwrap()).await?;
         }
 
-        Commands::Validate { file } => {
+        Some(Commands::Validate { file }) => {
             validate_script_file(&file)?;
         }
 
-        Commands::List => {
+        Some(Commands::List) => {
             list_available_commands();
         }
 
-        Commands::ShowHelp => {
+        Some(Commands::ShowHelp) => {
             show_detailed_command_help();
         }
 
-        Commands::Examples => {
+        Some(Commands::Examples) => {
             show_examples();
         }
 
-        Commands::Edit {
+        Some(Commands::Edit {
             command,
             empty,
             editor,
-        } => {
+        }) => {
             execute_edit_command(
                 executor.as_mut().unwrap(),
                 command,
@@ -243,14 +238,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn parse_command_with_sql_fallback(
-    command: &str,
-) -> Result<DSLCommand, Box<dyn std::error::Error>> {
-    // Use the unified parser which automatically detects SQL vs DSL syntax
-    // Note: This function is deprecated and should be replaced with AST-based execution
-    UnifiedParser::parse_to_command(command).map_err(|e| e.into())
 }
 
 /// Split input into individual commands by semicolon
@@ -291,11 +278,12 @@ async fn execute_single_command(
     info!("Executing DSL command: {}", command);
     debug!("Parsing command: {}", command);
 
-    match parse_command_with_sql_fallback(command) {
-        Ok(parsed_command) => {
-            debug!("Command parsed successfully: {:?}", parsed_command);
+    // Use direct AST parsing and execution
+    match UnifiedParser::parse(command) {
+        Ok(ast_node) => {
+            debug!("Command parsed successfully to AST: {:?}", ast_node);
 
-            match executor.execute(parsed_command).await {
+            match executor.execute_ast(&ast_node).await {
                 Ok(result) => {
                     if result.is_success() {
                         info!("✅ Command executed successfully");
@@ -348,7 +336,7 @@ async fn execute_script_file(
     let script_content = fs::read_to_string(file_path)?;
     println!("Executing script from: {file_path}");
 
-    match executor.execute_script(&script_content).await {
+    match executor.execute_ast_script(&script_content).await {
         Ok(batch_result) => {
             println!("✅ Script executed successfully");
             println!(
@@ -1503,45 +1491,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_command_with_sql_fallback_invalid_field() {
-        let result = parse_command_with_sql_fallback("select n from cluster");
-        println!("Result: {result:?}");
-        match &result {
-            Ok(command) => {
-                println!("Command: {command:?}");
-                println!("Command Type: {:?}", command.command_type);
-                println!("Parameters: {:?}", command.parameters);
-            }
-            Err(e) => {
-                println!("Error: {e:?}");
-            }
-        }
-        // The old architecture validated fields at parse time, but the new AST-based architecture
-        // may defer validation to execution time. Let's update this test accordingly.
-        // For now, we'll just check that parsing succeeds (which it should for syntactically valid SQL)
+    fn test_ast_parsing_valid_sql() {
+        let result = UnifiedParser::parse("select displayName from cluster");
+        println!("AST Result: {result:?}");
         assert!(
             result.is_ok(),
-            "Parsing should succeed for syntactically valid SQL, even with invalid field names"
+            "AST parsing should succeed for valid SQL syntax"
         );
     }
 
     #[test]
-    fn test_parse_command_with_sql_fallback_valid_sql() {
-        let result = parse_command_with_sql_fallback("select displayName from cluster");
-        assert!(result.is_ok());
+    fn test_ast_parsing_with_field_validation_deferred() {
+        let result = UnifiedParser::parse("select n from cluster");
+        println!("AST Result: {result:?}");
+        // The new AST-based architecture allows syntactically valid SQL to parse
+        // Field validation is deferred to execution time
+        assert!(
+            result.is_ok(),
+            "AST parsing should succeed for syntactically valid SQL"
+        );
     }
 
     #[test]
-    fn test_parse_command_with_sql_fallback_dsl_command() {
-        let result = parse_command_with_sql_fallback("list clusters");
-        assert!(result.is_ok());
+    fn test_ast_parsing_echo_command() {
+        let result = UnifiedParser::parse("echo \"Hello World\"");
+        println!("AST Result: {result:?}");
+        assert!(
+            result.is_ok(),
+            "AST parsing should succeed for echo commands"
+        );
     }
 
     #[test]
-    fn test_parse_command_with_sql_fallback_backups_all_clusters() {
-        let result = parse_command_with_sql_fallback("SELECT * FROM BACKUPS");
-        assert!(result.is_ok());
-        let command = result.unwrap();
-        assert_eq!(command.command_type, DSLCommandType::ListBackups);
+    fn test_ast_parsing_select_backups() {
+        let result = UnifiedParser::parse("SELECT * FROM BACKUPS");
+        println!("AST Result: {result:?}");
+        assert!(
+            result.is_ok(),
+            "AST parsing should succeed for SELECT queries"
+        );
+
+        // Verify it creates a Select AST node
+        let ast = result.unwrap();
+        match ast {
+            tidb_cli::dsl::ast::ASTNode::Query(tidb_cli::dsl::ast::QueryNode::Select {
+                ..
+            }) => {
+                // Success - it's a Select query
+            }
+            _ => panic!("Expected SELECT query to create a Select AST node"),
+        }
     }
 }

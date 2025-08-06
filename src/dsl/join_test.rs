@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::dsl::{
-        ast_dsl_transformer::ASTDSLTransformer, executor::DSLExecutor, sql_ast_parser::SQLASTParser,
-    };
+    use crate::dsl::{executor::DSLExecutor, sql_ast_parser::SQLASTParser};
     use crate::tidb_cloud::TiDBCloudClient;
 
     #[tokio::test]
@@ -17,63 +15,52 @@ mod tests {
         // Parse the problematic query
         let query = "select * from backups where backups.tidbId = clusters.tidbid and clusters.displayName = 'SB-Test01-delete-whenever'";
 
-        // Step 1: Test SQL parsing
+        // Step 1: Test SQL parsing to AST
         let ast_result = SQLASTParser::parse(query);
         println!("AST parsing result: {ast_result:?}");
         assert!(ast_result.is_ok());
 
-        // Step 2: Test AST to DSL transformation
         let ast_node = ast_result.unwrap();
-        let command_result = ASTDSLTransformer::transform(&ast_node);
-        println!("Command transformation result: {command_result:?}");
-        assert!(command_result.is_ok());
+        println!("Generated AST: {ast_node:?}");
 
-        let command = command_result.unwrap();
-        println!("Generated command: {command:?}");
+        // Step 2: Test direct AST execution (note: this will attempt to call the API)
+        // In a real test, we would mock the API calls, but for now we just verify the AST structure
 
-        // Step 3: Check that the command properly represents the join
-        // The current implementation treats joins as ListBackups with a complex where clause
-        // but this doesn't actually perform the join - it just tries to filter backups
-
-        // Now it should create a proper JOIN command instead of ListBackups
-        assert_eq!(format!("{:?}", command.command_type), "Join");
-
-        // Verify JOIN parameters
-        assert!(command.parameters.contains_key("left_table"));
-        assert!(command.parameters.contains_key("right_table"));
-        assert!(command.parameters.contains_key("on_condition"));
-        assert!(command.parameters.contains_key("where_clause"));
-
-        // Check table names
-        if let Some(crate::dsl::syntax::DSLValue::String(table_str)) =
-            command.parameters.get("left_table")
+        // Verify the AST represents a SELECT with JOIN
+        if let crate::dsl::ast::ASTNode::Query(crate::dsl::ast::QueryNode::Select {
+            from,
+            where_clause,
+            ..
+        }) = &ast_node
         {
-            assert_eq!(table_str, "BACKUPS");
-        }
+            // Check that FROM clause is a JOIN
+            if let crate::dsl::ast::ASTNode::Query(crate::dsl::ast::QueryNode::Join {
+                left,
+                right,
+                on_condition,
+                ..
+            }) = from.as_ref()
+            {
+                println!("Found JOIN in AST with left: {left:?}, right: {right:?}");
+                println!("ON condition: {on_condition:?}");
 
-        if let Some(crate::dsl::syntax::DSLValue::String(table_str)) =
-            command.parameters.get("right_table")
-        {
-            assert_eq!(table_str, "CLUSTERS");
-        }
+                // This verifies the AST is correctly structured for JOIN execution
+                assert!(matches!(
+                    left.as_ref(),
+                    crate::dsl::ast::ASTNode::Query(crate::dsl::ast::QueryNode::Table { .. })
+                ));
+                assert!(matches!(
+                    right.as_ref(),
+                    crate::dsl::ast::ASTNode::Query(crate::dsl::ast::QueryNode::Table { .. })
+                ));
 
-        // Check ON condition
-        if let Some(crate::dsl::syntax::DSLValue::String(on_str)) =
-            command.parameters.get("on_condition")
-        {
-            println!("ON condition: {on_str}");
-            assert!(on_str.contains("tidbId"));
-        }
-
-        // Check WHERE clause
-        if let Some(crate::dsl::syntax::DSLValue::String(where_str)) =
-            command.parameters.get("where_clause")
-        {
-            println!("Where clause: {where_str}");
-            assert!(where_str.contains("displayName"));
-            assert!(where_str.contains("SB-Test01-delete-whenever"));
+                // Verify WHERE clause exists
+                assert!(where_clause.is_some());
+            } else {
+                panic!("Expected JOIN node in FROM clause");
+            }
         } else {
-            panic!("Expected where_clause parameter");
+            panic!("Expected SELECT node with JOIN");
         }
     }
 

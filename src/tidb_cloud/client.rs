@@ -1,6 +1,6 @@
 use crate::tidb_cloud::{
-    API_BASE_URL, DEFAULT_TIMEOUT, DEFAULT_USER_AGENT,
     config::TiDBCloudConfig,
+    constants::{DEFAULT_TIMEOUT_SECS, DEFAULT_USER_AGENT, PRODUCTION_API_URL},
     debug_logger::DebugLogger,
     error::{TiDBCloudError, TiDBCloudResult},
     http_utils::{HttpMethods, HttpRequestBuilder},
@@ -21,8 +21,8 @@ impl TiDBCloudClient {
     pub fn new(api_key: String) -> TiDBCloudResult<Self> {
         Self::with_config(
             api_key,
-            API_BASE_URL.to_string(),
-            DEFAULT_TIMEOUT,
+            PRODUCTION_API_URL.to_string(),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             DebugLogger::default(),
         )
     }
@@ -32,8 +32,8 @@ impl TiDBCloudClient {
         Self::with_config_and_credentials(
             username,
             password,
-            API_BASE_URL.to_string(),
-            DEFAULT_TIMEOUT,
+            PRODUCTION_API_URL.to_string(),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             DebugLogger::default(),
         )
     }

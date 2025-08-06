@@ -42,7 +42,6 @@
 //! ```
 
 pub mod ast;
-pub mod ast_dsl_transformer;
 pub mod commands;
 pub mod dsl_ast_parser;
 pub mod error;
@@ -55,8 +54,7 @@ pub mod unified_parser;
 mod join_test;
 
 pub use ast::{ASTNode, ASTPrinter, ASTTransformer, ASTValidator, ASTVisitor};
-pub use ast_dsl_transformer::ASTDSLTransformer;
-pub use commands::{DSLCommand, DSLCommandFactory, DSLResult};
+pub use commands::DSLResult;
 pub use dsl_ast_parser::DSLASTParser;
 pub use error::{DSLError, DSLResult as Result};
 pub use executor::DSLExecutor;

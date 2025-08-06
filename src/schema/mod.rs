@@ -2,6 +2,28 @@ use crate::tidb_cloud::models::{Backup, Tidb};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Trait for types that can provide field values dynamically
+pub trait FieldAccessor {
+    /// Get the logical type name for this object
+    fn object_type(&self) -> &'static str;
+
+    /// Get a field value by canonical field name using schema lookup
+    fn get_field_value(&self, field_name: &str) -> Option<String>;
+
+    /// Get all field values as a HashMap using schema-defined fields
+    fn get_all_field_values(&self) -> HashMap<String, String>;
+
+    /// Check if a field exists for this object type
+    fn has_field(&self, field_name: &str) -> bool {
+        crate::schema::SCHEMA.is_valid_field(self.object_type(), field_name)
+    }
+
+    /// Get the JSON representation of a field for API responses
+    fn get_field_json_name(&self, field_name: &str) -> Option<String> {
+        crate::schema::SCHEMA.get_json_name(self.object_type(), field_name)
+    }
+}
+
 /// Represents a field type in the schema
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldType {
@@ -350,7 +372,10 @@ impl SchemaRegistry {
         value: &str,
     ) -> Option<String> {
         self.get_field(object_type, field_name).and_then(|field| {
-            if let FieldType::Enum { values, .. } = &field.field_type {
+            // Get the actual field type, unwrapping Optional if needed
+            let field_type = field.field_type.get_actual_type();
+
+            if let FieldType::Enum { values, .. } = field_type {
                 // Check if the value matches any of the enum values (case-insensitive)
                 values
                     .iter()
@@ -1428,6 +1453,54 @@ lazy_static::lazy_static! {
 
         registry
     };
+}
+
+/// Implementation of FieldAccessor for Tidb using the global field accessor registry
+impl FieldAccessor for Tidb {
+    fn object_type(&self) -> &'static str {
+        "Tidb"
+    }
+
+    fn get_field_value(&self, field_name: &str) -> Option<String> {
+        FIELD_ACCESSORS.get_field_value(self, field_name)
+    }
+
+    fn get_all_field_values(&self) -> HashMap<String, String> {
+        let mut values = HashMap::new();
+        let field_names = SCHEMA.get_field_names(self.object_type());
+
+        for field_name in field_names {
+            if let Some(value) = self.get_field_value(&field_name) {
+                values.insert(field_name, value);
+            }
+        }
+
+        values
+    }
+}
+
+/// Implementation of FieldAccessor for Backup using the global field accessor registry
+impl FieldAccessor for Backup {
+    fn object_type(&self) -> &'static str {
+        "Backup"
+    }
+
+    fn get_field_value(&self, field_name: &str) -> Option<String> {
+        FIELD_ACCESSORS.get_backup_field_value(self, field_name)
+    }
+
+    fn get_all_field_values(&self) -> HashMap<String, String> {
+        let mut values = HashMap::new();
+        let field_names = SCHEMA.get_field_names(self.object_type());
+
+        for field_name in field_names {
+            if let Some(value) = self.get_field_value(&field_name) {
+                values.insert(field_name, value);
+            }
+        }
+
+        values
+    }
 }
 
 #[cfg(test)]

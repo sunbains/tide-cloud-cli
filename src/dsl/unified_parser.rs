@@ -33,8 +33,8 @@ impl UnifiedParser {
         // Check for SQL keywords at the start
         input_upper.starts_with("SELECT")
             || input_upper.starts_with("INSERT")
-            || input_upper.starts_with("UPDATE")
-            || input_upper.starts_with("DELETE")
+            || (input_upper.starts_with("UPDATE") && !input_upper.starts_with("UPDATE CLUSTER"))  // Exclude DSL UPDATE CLUSTER
+            || input_upper.starts_with("DELETE FROM")  // More specific - only SQL DELETE FROM, not DSL DELETE CLUSTER
             || input_upper.starts_with("CREATE TABLE")
             || input_upper.starts_with("DROP TABLE")
             || input_upper.starts_with("ALTER TABLE")
@@ -58,36 +58,12 @@ impl UnifiedParser {
 
         Ok(ast_nodes)
     }
-
-    /// Parse input and convert directly to DSL command (DEPRECATED - use AST execution instead)
-    pub fn parse_to_command(input: &str) -> DSLResult<crate::dsl::commands::DSLCommand> {
-        let ast = Self::parse(input)?;
-        crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(&ast)
-    }
-
-    /// Parse script and convert directly to DSL commands (DEPRECATED - use AST execution instead)
-    pub fn parse_script_to_commands(
-        input: &str,
-    ) -> DSLResult<Vec<crate::dsl::commands::DSLCommand>> {
-        let ast_nodes = Self::parse_script(input)?;
-        let mut commands = Vec::new();
-
-        for node in ast_nodes {
-            let command = crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(&node)?;
-            commands.push(command);
-        }
-
-        Ok(commands)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::{
-        ast::{CommandNode, ExpressionNode, QueryNode},
-        syntax::DSLValue,
-    };
+    use crate::dsl::ast::{CommandNode, ExpressionNode, QueryNode};
 
     #[test]
     fn test_detect_sql_syntax() {
@@ -170,46 +146,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_to_command() {
-        let result = UnifiedParser::parse_to_command("CREATE CLUSTER my-cluster IN aws-us-west-1");
-        assert!(result.is_ok());
-
-        if let Ok(command) = result {
-            assert_eq!(
-                command.command_type,
-                crate::dsl::commands::DSLCommandType::CreateCluster
-            );
-            assert_eq!(
-                command.get_parameter("name").unwrap(),
-                &DSLValue::String("my-cluster".to_string())
-            );
-            assert_eq!(
-                command.get_parameter("region").unwrap(),
-                &DSLValue::String("aws-us-west-1".to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_sql_to_command() {
-        let result = UnifiedParser::parse_to_command(
-            "SELECT * FROM BACKUPS WHERE CLUSTER.displayName = '.*'",
-        );
-        assert!(result.is_ok());
-
-        if let Ok(command) = result {
-            assert_eq!(
-                command.command_type,
-                crate::dsl::commands::DSLCommandType::ListBackups
-            );
-            assert_eq!(
-                command.get_parameter("where_clause").unwrap(),
-                &DSLValue::String("CLUSTER.displayName = '.*'".to_string())
-            );
-        }
-    }
-
-    #[test]
     fn test_parse_describe_table() {
         let result = UnifiedParser::parse("DESCRIBE TABLE BACKUPS");
         assert!(result.is_ok());
@@ -218,27 +154,6 @@ mod tests {
             assert_eq!(table_name, "BACKUPS");
         } else {
             panic!("Expected DescribeTable node");
-        }
-    }
-
-    #[test]
-    fn test_parse_describe_table_to_command() {
-        let result = UnifiedParser::parse_to_command("DESCRIBE TABLE CLUSTERS");
-        assert!(result.is_ok());
-
-        if let Ok(command) = result {
-            assert_eq!(
-                command.command_type,
-                crate::dsl::commands::DSLCommandType::Echo
-            );
-            let message = command.get_parameter("message").unwrap();
-            assert!(matches!(message, DSLValue::String(_)));
-            if let DSLValue::String(msg) = message {
-                assert!(msg.contains("Column Name"));
-                assert!(msg.contains("Type"));
-                assert!(msg.contains("displayName"));
-                assert!(msg.contains("VARCHAR"));
-            }
         }
     }
 }

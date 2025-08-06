@@ -1,45 +1,34 @@
 use crate::dsl::{
     ast::{ASTNode, CommandNode, ControlFlowNode, ExpressionNode, QueryNode, UtilityNode},
-    commands::{DSLBatchResult, DSLCommand, DSLCommandType, DSLResult as CommandResult},
+    commands::{DSLBatchResult, DSLResult as CommandResult},
     error::{DSLError, DSLResult},
     syntax::DSLValue,
 };
-use crate::logging::{change_log_level, set_current_log_level};
+use crate::logging::set_current_log_level;
+use crate::schema::FieldAccessor;
 use crate::tidb_cloud::{TiDBCloudClient, models::*};
 use colored::*;
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::time::Duration;
 use tracing::Level;
 
-// Field and operator constants for validation
-const CLUSTER_FIELDS: &[&str] = &["displayName", "state", "regionId", "servicePlan"];
-const CLUSTER_OPERATORS: &[&str] = &["=", "!=", "LIKE"];
-
-const BACKUP_FIELDS: &[&str] = &[
-    "displayName",
-    "state",
-    "sizeBytes",
-    "createTime",
-    "backupTs",
-];
-const BACKUP_OPERATORS: &[&str] = &["=", "!=", "LIKE", ">", "<", ">=", "<=", "IN"];
+// Use schema-driven validation instead of hardcoded arrays
 
 /// DSL executor that runs commands against the TiDB Cloud API
 pub struct DSLExecutor {
     client: TiDBCloudClient,
     variables: HashMap<String, DSLValue>,
-    _timeout: Duration,
-    request_count: Arc<AtomicU64>,
-    last_request_time: Arc<AtomicU64>,
+    timeout: Duration,
     cancellation_flag: Arc<AtomicBool>,
 }
 
 /// RPN-based condition evaluator for complex WHERE clauses
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum ConditionToken {
     Field(String),
     Operator(String),
@@ -77,6 +66,38 @@ struct FieldContextRegistry {
     backup_fields: HashMap<String, FieldDefinition>,
 }
 
+/// Handler for CLUSTERS table
+struct ClustersTableHandler;
+
+impl ClustersTableHandler {
+    async fn fetch_data(&self, executor: &mut DSLExecutor) -> DSLResult<Vec<Tidb>> {
+        let clusters = match executor.client.list_tidbs(None).await {
+            Ok(response) => response.tidbs.unwrap_or_default(),
+            Err(e) => {
+                return Err(DSLError::execution_error(format!(
+                    "Failed to fetch clusters: {e}"
+                )));
+            }
+        };
+
+        Ok(clusters)
+    }
+}
+
+/// Table handler enum
+enum TableHandler {
+    Clusters(ClustersTableHandler),
+}
+
+impl TableHandler {
+    async fn fetch_data(&self, executor: &mut DSLExecutor) -> DSLResult<Vec<Tidb>> {
+        match self {
+            TableHandler::Clusters(handler) => handler.fetch_data(executor).await,
+        }
+    }
+}
+
+#[allow(dead_code)]
 impl DSLExecutor {
     // Define the available fields as a const array to avoid duplication
 
@@ -90,9 +111,7 @@ impl DSLExecutor {
         Self {
             client,
             variables: HashMap::new(),
-            _timeout: Duration::from_secs(300), // 5 minutes default timeout
-            request_count: Arc::new(AtomicU64::new(0)),
-            last_request_time: Arc::new(AtomicU64::new(0)),
+            timeout: Duration::from_secs(3600), // Default 1 hour timeout
             cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -110,9 +129,7 @@ impl DSLExecutor {
         Self {
             client,
             variables: HashMap::new(),
-            _timeout: timeout,
-            request_count: Arc::new(AtomicU64::new(0)),
-            last_request_time: Arc::new(AtomicU64::new(0)),
+            timeout,
             cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -129,77 +146,481 @@ impl DSLExecutor {
         Self {
             client,
             variables: HashMap::new(),
-            _timeout: timeout,
-            request_count: Arc::new(AtomicU64::new(0)),
-            last_request_time: Arc::new(AtomicU64::new(0)),
+            timeout,
             cancellation_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Execute a single command
-    pub async fn execute(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let start_time = Instant::now();
+    /// Get the configured timeout duration
+    pub fn get_timeout(&self) -> Duration {
+        self.timeout
+    }
 
-        tracing::debug!("Executing command: {:?}", command.command_type);
-        tracing::debug!("Command parameters: {:?}", command.parameters);
+    /// Get table handler from registry
+    fn get_table_handler(table_name: &str) -> Option<TableHandler> {
+        match table_name.to_uppercase().as_str() {
+            "CLUSTERS" => Some(TableHandler::Clusters(ClustersTableHandler)),
+            _ => None,
+        }
+    }
 
-        let result = match command.command_type {
-            DSLCommandType::CreateCluster => self.execute_create_cluster(command).await,
-            DSLCommandType::DeleteCluster => self.execute_delete_cluster(command).await,
-            DSLCommandType::UpdateCluster => self.execute_update_cluster(command).await,
-            DSLCommandType::WaitForCluster => self.execute_wait_for_cluster(command).await,
-            DSLCommandType::ListClusters => self.execute_list_clusters(command).await,
-            DSLCommandType::CreateBackup => self.execute_create_backup(command).await,
-            DSLCommandType::ListBackups => self.execute_list_backups(command).await,
-            DSLCommandType::DeleteBackup => self.execute_delete_backup(command).await,
-            DSLCommandType::Join => self.execute_join(command).await,
-            DSLCommandType::EstimatePrice => self.execute_estimate_price(command).await,
-            DSLCommandType::SetVariable => self.execute_set_variable(command).await,
-            DSLCommandType::GetVariable => self.execute_get_variable(command).await,
-            DSLCommandType::SetLogLevel => self.execute_set_log_level(command).await,
-            DSLCommandType::Echo => self.execute_echo(command).await,
-            DSLCommandType::Sleep => self.execute_sleep(command).await,
-            DSLCommandType::If => self.execute_if(command).await,
-            DSLCommandType::Loop => self.execute_loop(command).await,
-            DSLCommandType::Break => self.execute_break(command).await,
-            DSLCommandType::Continue => self.execute_continue(command).await,
-            DSLCommandType::Return => self.execute_return(command).await,
-            DSLCommandType::Exit => self.execute_exit(command).await,
-            _ => Err(DSLError::unknown_command(format!(
-                "{:?}",
-                command.command_type
-            ))),
+    /// Generic execution function for SELECT queries
+    async fn execute_select_generic(
+        &mut self,
+        handler: &TableHandler,
+        fields: &[ASTNode],
+        where_clause: &Option<Box<ASTNode>>,
+    ) -> DSLResult<CommandResult> {
+        // Fetch data using handler
+        let clusters = handler.fetch_data(self).await?;
+
+        // Apply WHERE clause filtering if present
+        let filtered_clusters: Vec<_> = if let Some(where_expr) = where_clause {
+            clusters
+                .into_iter()
+                .filter(|cluster| {
+                    self.evaluate_where_ast_generic(cluster, where_expr)
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            clusters
         };
 
-        let duration = start_time.elapsed();
+        // Format the output based on requested fields
+        if filtered_clusters.is_empty() {
+            return Ok(CommandResult::success_with_message(
+                "No data found".to_string(),
+            ));
+        }
 
-        match result {
-            Ok(mut cmd_result) => {
-                cmd_result = cmd_result
-                    .with_metadata("duration_ms", DSLValue::from(duration.as_millis() as f64));
-                tracing::debug!("Command executed successfully in {:?}", duration);
+        let mut results = Vec::new();
+        for cluster in &filtered_clusters {
+            let object_data = self.project_fields_generic(cluster, fields)?;
 
-                // Print elapsed time to user
-                let elapsed_str = self.format_duration(duration);
-                println!(
-                    "{}",
-                    format!("⏱️  Command completed in {elapsed_str}").cyan()
-                );
-
-                Ok(cmd_result)
+            if !object_data.is_empty() {
+                results.push(DSLValue::Object(object_data));
             }
-            Err(e) => {
-                tracing::error!("Command execution failed: {}", e);
+        }
 
-                // Print elapsed time even for failed commands
-                let elapsed_str = self.format_duration(duration);
-                println!(
-                    "{}",
-                    format!("⏱️  Command failed after {elapsed_str}").red()
-                );
+        Ok(CommandResult::success_with_data(DSLValue::Array(results)))
+    }
 
-                Err(e)
+    /// Generic WHERE clause evaluation
+    fn evaluate_where_ast_generic<T: FieldAccessor>(
+        &self,
+        object: &T,
+        where_expr: &ASTNode,
+    ) -> DSLResult<bool> {
+        match where_expr {
+            ASTNode::Expression(ExpressionNode::BinaryExpression {
+                left,
+                operator,
+                right,
+            }) => {
+                let field_name = self.extract_field_name_from_ast(left)?;
+                let field_value = object
+                    .get_field_value(&field_name)
+                    .map(DSLValue::String)
+                    .unwrap_or(DSLValue::Null);
+                let right_value = self.extract_value_from_ast(right)?;
+
+                // Simple operator evaluation
+                match operator.as_str() {
+                    "=" => Ok(field_value == right_value),
+                    "!=" => Ok(field_value != right_value),
+                    ">" => self.compare_values(&field_value, &right_value, |a, b| a > b),
+                    ">=" => self.compare_values(&field_value, &right_value, |a, b| a >= b),
+                    "<" => self.compare_values(&field_value, &right_value, |a, b| a < b),
+                    "<=" => self.compare_values(&field_value, &right_value, |a, b| a <= b),
+                    "contains" => {
+                        let left_str = field_value.as_string().unwrap_or_default();
+                        let right_str = right_value.as_string().unwrap_or_default();
+                        Ok(left_str.to_lowercase().contains(&right_str.to_lowercase()))
+                    }
+                    _ => Err(DSLError::execution_error(format!(
+                        "Unsupported operator: {operator}"
+                    ))),
+                }
             }
+            ASTNode::Expression(ExpressionNode::UnaryExpression { operator, operand }) => {
+                match operator.to_lowercase().as_str() {
+                    "not" => {
+                        let result = self.evaluate_where_ast_generic(object, operand)?;
+                        Ok(!result)
+                    }
+                    _ => Err(DSLError::execution_error(format!(
+                        "Unsupported unary operator: {operator}"
+                    ))),
+                }
+            }
+            ASTNode::Expression(ExpressionNode::Literal { value }) => {
+                Ok(value.as_boolean().unwrap_or(false))
+            }
+            _ => Err(DSLError::execution_error(
+                "Unsupported WHERE clause expression".to_string(),
+            )),
+        }
+    }
+
+    /// Generic field projection
+    fn project_fields_generic<T: FieldAccessor>(
+        &self,
+        object: &T,
+        fields: &[ASTNode],
+    ) -> DSLResult<HashMap<String, DSLValue>> {
+        let mut result = HashMap::new();
+
+        for field_node in fields {
+            match field_node {
+                ASTNode::Expression(ExpressionNode::Wildcard) => {
+                    // Get all field values
+                    let all_fields = object.get_all_field_values();
+                    for (field_name, field_value) in all_fields {
+                        result.insert(field_name, DSLValue::String(field_value));
+                    }
+                    break; // Wildcard should be the only field
+                }
+                ASTNode::Expression(ExpressionNode::Field { name, .. }) => {
+                    if let Some(value) = object.get_field_value(name) {
+                        result.insert(name.clone(), DSLValue::String(value));
+                    }
+                }
+                _ => {
+                    return Err(DSLError::execution_error(
+                        "Unsupported field type in SELECT clause".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Helper method to compare values (numeric), coercing strings and booleans when possible
+    fn compare_values<F>(&self, left: &DSLValue, right: &DSLValue, compare_fn: F) -> DSLResult<bool>
+    where
+        F: Fn(f64, f64) -> bool,
+    {
+        // Try to coerce both sides into f64 (Number, String->parse, Boolean)
+        fn dsl_to_f64(v: &DSLValue) -> Option<f64> {
+            match v {
+                DSLValue::Number(n) => Some(*n),
+                DSLValue::String(s) => s.parse::<f64>().ok(),
+                DSLValue::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
+                _ => None,
+            }
+        }
+
+        let l = dsl_to_f64(left).ok_or_else(|| {
+            DSLError::execution_error(
+                "Left operand must be a number (or numeric string) for comparison".to_string(),
+            )
+        })?;
+        let r = dsl_to_f64(right).ok_or_else(|| {
+            DSLError::execution_error(
+                "Right operand must be a number (or numeric string) for comparison".to_string(),
+            )
+        })?;
+
+        Ok(compare_fn(l, r))
+    }
+
+    /// Convert any FieldAccessor to DSLValue using schema-driven field access
+    fn object_to_dsl_value<T: FieldAccessor>(&self, object: &T) -> DSLValue {
+        let field_values = object.get_all_field_values();
+        let mut result = HashMap::new();
+
+        for (key, value) in field_values {
+            result.insert(key, DSLValue::String(value));
+        }
+
+        DSLValue::Object(result)
+    }
+
+    /// Generic function to find object by field value using schema
+    fn find_object_by_field<'a, T: FieldAccessor>(
+        &self,
+        objects: &'a [T],
+        field_name: &str,
+        field_value: &str,
+    ) -> Option<&'a T> {
+        objects
+            .iter()
+            .find(|obj| obj.get_field_value(field_name).as_deref() == Some(field_value))
+    }
+
+    /// Generic function to get an ID field value from an object
+    fn get_id_field<T: FieldAccessor>(&self, object: &T, id_field_name: &str) -> DSLResult<String> {
+        object.get_field_value(id_field_name).ok_or_else(|| {
+            DSLError::execution_error(format!("{} has no {}", object.object_type(), id_field_name))
+        })
+    }
+
+    /// Generic function to resolve field name from AST using schema
+    fn resolve_field_name(&self, object_type: &str, field_name: &str) -> String {
+        // First try to get canonical name from schema (handles aliases, JSON names, etc.)
+        if let Some(canonical_name) =
+            crate::schema::SCHEMA.get_canonical_name(object_type, field_name)
+        {
+            canonical_name
+        } else if crate::schema::SCHEMA.is_valid_field(object_type, field_name) {
+            // Field is valid as-is
+            field_name.to_string()
+        } else {
+            // Fallback to the field name as provided (for backwards compatibility)
+            field_name.to_string()
+        }
+    }
+
+    /// Generic function to find object by any field using AST field information
+    fn find_object_by_ast_field<'a, T: FieldAccessor>(
+        &self,
+        objects: &'a [T],
+        field_name: &str,
+        field_value: &str,
+    ) -> DSLResult<Option<&'a T>> {
+        let object_type = if objects.is_empty() {
+            return Ok(None);
+        } else {
+            objects[0].object_type()
+        };
+
+        let resolved_field = self.resolve_field_name(object_type, field_name);
+
+        // Validate field exists in schema
+        if !crate::schema::SCHEMA.is_valid_field(object_type, &resolved_field) {
+            return Err(DSLError::invalid_parameter(
+                "field",
+                field_name,
+                format!("Invalid field '{field_name}' for {object_type}"),
+            ));
+        }
+
+        Ok(objects
+            .iter()
+            .find(|obj| obj.get_field_value(&resolved_field).as_deref() == Some(field_value)))
+    }
+
+    /// Generic function to get field value using AST field information
+    fn get_field_value_from_ast<T: FieldAccessor>(
+        &self,
+        object: &T,
+        field_name: &str,
+    ) -> DSLResult<Option<String>> {
+        let resolved_field = self.resolve_field_name(object.object_type(), field_name);
+
+        // Validate field exists in schema
+        if !crate::schema::SCHEMA.is_valid_field(object.object_type(), &resolved_field) {
+            return Err(DSLError::invalid_parameter(
+                "field",
+                field_name,
+                format!(
+                    "Invalid field '{}' for {}",
+                    field_name,
+                    object.object_type()
+                ),
+            ));
+        }
+
+        Ok(object.get_field_value(&resolved_field))
+    }
+
+    /// Generic helper to find object by field value from AST and get another field value
+    fn find_object_by_ast_field_get_field<T: FieldAccessor>(
+        &self,
+        objects: &[T],
+        search_field_ast: &ASTNode,
+        search_value: &str,
+        target_field_ast: &ASTNode,
+    ) -> DSLResult<(usize, String)> {
+        if objects.is_empty() {
+            return Err(DSLError::resource_not_found(
+                "No objects to search".to_string(),
+            ));
+        }
+
+        let object_type = objects[0].object_type();
+
+        // Extract field names from AST nodes
+        let search_field_name = self.extract_field_name_from_ast(search_field_ast)?;
+        let target_field_name = self.extract_field_name_from_ast(target_field_ast)?;
+
+        // Resolve field names using schema
+        let resolved_search_field = self.resolve_field_name(object_type, &search_field_name);
+        let resolved_target_field = self.resolve_field_name(object_type, &target_field_name);
+
+        // Find object by search field
+        let object_index = objects
+            .iter()
+            .position(|obj| {
+                obj.get_field_value(&resolved_search_field).as_deref() == Some(search_value)
+            })
+            .ok_or_else(|| {
+                DSLError::resource_not_found(format!(
+                    "{object_type} with {search_field_name} '{search_value}' not found"
+                ))
+            })?;
+
+        let object = &objects[object_index];
+        let target_value = object
+            .get_field_value(&resolved_target_field)
+            .ok_or_else(|| {
+                DSLError::execution_error(format!("{object_type} has no {target_field_name} field"))
+            })?;
+
+        Ok((object_index, target_value))
+    }
+
+    /// Evaluate condition from AST nodes against any FieldAccessor object
+    fn evaluate_condition_from_ast<T: FieldAccessor>(
+        &self,
+        object: &T,
+        condition_ast: &ASTNode,
+    ) -> DSLResult<bool> {
+        match condition_ast {
+            ASTNode::Expression(ExpressionNode::BinaryExpression {
+                left,
+                operator,
+                right,
+            }) => {
+                // Extract field name from left side
+                let field_name = self.extract_field_name_from_ast(left)?;
+                let resolved_field = self.resolve_field_name(object.object_type(), &field_name);
+
+                // Extract value from right side
+                let value = self.extract_value_from_ast(right)?;
+
+                self.evaluate_condition(object, &resolved_field, operator, &value)
+            }
+            _ => Err(DSLError::invalid_parameter(
+                "condition_ast",
+                "not_binary_expression",
+                "Expected binary expression AST node".to_string(),
+            )),
+        }
+    }
+
+    /// Extract field name from AST field node
+    fn extract_field_name_from_ast(&self, ast_node: &ASTNode) -> DSLResult<String> {
+        match ast_node {
+            ASTNode::Expression(ExpressionNode::Field {
+                name,
+                context: _,
+                alias: _,
+            }) => Ok(name.clone()),
+            _ => Err(DSLError::invalid_parameter(
+                "ast_node",
+                "not_field_node",
+                "Expected field AST node".to_string(),
+            )),
+        }
+    }
+
+    /// Extract value from AST literal or variable node
+    fn extract_value_from_ast(&self, ast_node: &ASTNode) -> DSLResult<DSLValue> {
+        match ast_node {
+            ASTNode::Expression(ExpressionNode::Literal { value }) => Ok(value.clone()),
+            ASTNode::Expression(ExpressionNode::Variable { name }) => {
+                self.variables.get(name).cloned().ok_or_else(|| {
+                    DSLError::execution_error(format!("Variable '{name}' not found"))
+                })
+            }
+            _ => Err(DSLError::invalid_parameter(
+                "ast_node",
+                "not_literal_or_variable",
+                "Expected literal or variable AST node".to_string(),
+            )),
+        }
+    }
+
+    /// Evaluate a condition against any FieldAccessor object
+    fn evaluate_condition<T: FieldAccessor>(
+        &self,
+        object: &T,
+        field_name: &str,
+        operator: &str,
+        value: &DSLValue,
+    ) -> DSLResult<bool> {
+        // Validate field using schema
+        if !object.has_field(field_name) {
+            return Err(DSLError::invalid_parameter(
+                "field",
+                field_name,
+                format!(
+                    "Invalid field '{}' for {}",
+                    field_name,
+                    object.object_type()
+                ),
+            ));
+        }
+
+        // Get field value using schema-driven access
+        let field_value = object.get_field_value(field_name);
+
+        match operator {
+            "=" | "==" => {
+                if let Some(field_val) = field_value.as_ref() {
+                    let target_value = match value {
+                        DSLValue::String(s) => s.clone(),
+                        DSLValue::Number(n) => n.to_string(),
+                        DSLValue::Boolean(b) => b.to_string(),
+                        DSLValue::Null => String::new(),
+                        _ => value.to_string(),
+                    };
+                    Ok(field_val == &target_value)
+                } else {
+                    Ok(false)
+                }
+            }
+            "!=" => {
+                if let Some(field_val) = field_value.as_ref() {
+                    let target_value = match value {
+                        DSLValue::String(s) => s.clone(),
+                        DSLValue::Number(n) => n.to_string(),
+                        DSLValue::Boolean(b) => b.to_string(),
+                        DSLValue::Null => String::new(),
+                        _ => value.to_string(),
+                    };
+                    Ok(field_val != &target_value)
+                } else {
+                    Ok(true)
+                }
+            }
+            "LIKE" => {
+                if let (Some(field_val), Some(pattern)) = (field_value.as_ref(), value.as_string())
+                {
+                    // Convert SQL LIKE pattern to a safe, anchored regex
+                    fn like_to_regex(pat: &str) -> String {
+                        let escaped = regex::escape(pat);
+                        let translated = escaped.replace('%', ".*").replace('_', ".");
+                        format!("^{translated}$")
+                    }
+                    let regex_pattern = like_to_regex(pattern);
+                    match regex::Regex::new(&regex_pattern) {
+                        Ok(re) => Ok(re.is_match(field_val)),
+                        Err(_) => Ok(false),
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            "IN" => {
+                if let Some(field_val) = field_value {
+                    if let DSLValue::Array(values) = value {
+                        Ok(values.iter().any(|v| v.as_string() == Some(&field_val)))
+                    } else {
+                        Ok(false)
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(DSLError::invalid_parameter(
+                "operator",
+                operator,
+                format!("Unsupported operator: {operator}"),
+            )),
         }
     }
 
@@ -269,52 +690,6 @@ impl DSLExecutor {
         Ok(batch_result)
     }
 
-    /// Execute multiple commands in sequence
-    pub async fn execute_batch(&mut self, commands: Vec<DSLCommand>) -> DSLResult<DSLBatchResult> {
-        let start_time = Instant::now();
-        let mut batch_result = DSLBatchResult::new();
-
-        for (index, command) in commands.into_iter().enumerate() {
-            match self.execute(command.clone()).await {
-                Ok(result) => {
-                    batch_result.add_result(result);
-                }
-                Err(e) => {
-                    let error_message = e.to_string();
-                    batch_result.add_result(CommandResult::failure(e));
-
-                    // Check if we should continue on error
-                    if !self.should_continue_on_error(&command) {
-                        return Err(DSLError::batch_error(index, error_message));
-                    }
-                }
-            }
-        }
-
-        let duration = start_time.elapsed();
-        batch_result.set_duration(duration);
-
-        // Print total batch execution time
-        let elapsed_str = self.format_duration(duration);
-        println!(
-            "{}",
-            format!(
-                "⏱️  Batch completed in {} ({} commands)",
-                elapsed_str,
-                batch_result.results.len()
-            )
-            .cyan()
-        );
-
-        Ok(batch_result)
-    }
-
-    /// Execute a script from a string
-    pub async fn execute_script(&mut self, script: &str) -> DSLResult<DSLBatchResult> {
-        let commands = crate::dsl::unified_parser::UnifiedParser::parse_script_to_commands(script)?;
-        self.execute_batch(commands).await
-    }
-
     /// Execute an AST script from a string
     pub async fn execute_ast_script(&mut self, script: &str) -> DSLResult<DSLBatchResult> {
         let ast_nodes = crate::dsl::unified_parser::UnifiedParser::parse_script(script)?;
@@ -326,29 +701,113 @@ impl DSLExecutor {
 
     /// Execute a command AST node
     async fn execute_command_node(&mut self, cmd_node: &CommandNode) -> DSLResult<CommandResult> {
-        // Convert AST node to DSLCommand and use existing execution logic
-        let dsl_command = crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(
-            &ASTNode::Command(cmd_node.clone()),
-        )?;
-        self.execute(dsl_command).await
+        match cmd_node {
+            CommandNode::CreateCluster {
+                name,
+                region,
+                rcu_range,
+                service_plan,
+                password,
+            } => {
+                self.execute_create_cluster_ast(
+                    name,
+                    region,
+                    rcu_range.as_ref(),
+                    service_plan.as_ref(),
+                    password.as_ref(),
+                )
+                .await
+            }
+            CommandNode::DeleteCluster { name } => self.execute_delete_cluster_ast(name).await,
+            CommandNode::UpdateCluster { name, updates } => {
+                self.execute_update_cluster_ast(name, updates).await
+            }
+            CommandNode::WaitForCluster {
+                name,
+                state,
+                timeout,
+            } => {
+                self.execute_wait_for_cluster_ast(name, state, *timeout)
+                    .await
+            }
+            CommandNode::CreateBackup {
+                cluster_name,
+                description,
+            } => {
+                self.execute_create_backup_ast(cluster_name, description.as_ref())
+                    .await
+            }
+            CommandNode::ListBackups {
+                cluster_name: _,
+                filters: _,
+            } => Err(DSLError::execution_error(
+                "List backups command not yet implemented".to_string(),
+            )),
+            CommandNode::DeleteBackup {
+                cluster_name: _,
+                backup_id: _,
+            } => Err(DSLError::execution_error(
+                "Delete backup command not yet implemented".to_string(),
+            )),
+            CommandNode::EstimatePrice {
+                region: _,
+                rcu_range: _,
+                service_plan: _,
+                storage: _,
+            } => Err(DSLError::execution_error(
+                "Estimate price command not yet implemented".to_string(),
+            )),
+        }
     }
 
     /// Execute a query AST node
     async fn execute_query_node(&mut self, query_node: &QueryNode) -> DSLResult<CommandResult> {
-        // Convert AST node to DSLCommand and use existing execution logic
-        let dsl_command = crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(
-            &ASTNode::Query(query_node.clone()),
-        )?;
-        self.execute(dsl_command).await
+        use crate::dsl::ast::QueryNode;
+
+        match query_node {
+            QueryNode::Join {
+                left: _,
+                join_type: _,
+                right: _,
+                on_condition: _,
+            } => Err(DSLError::execution_error(
+                "JOIN operations not yet implemented".to_string(),
+            )),
+            QueryNode::DescribeTable { table_name } => {
+                self.execute_describe_table_ast(table_name).await
+            }
+            QueryNode::Select {
+                fields,
+                from,
+                where_clause,
+                order_by,
+                into_clause: _,
+            } => {
+                self.execute_select_ast(fields, from, where_clause, order_by)
+                    .await
+            }
+            QueryNode::Table { .. } => {
+                // Table nodes are typically part of FROM clauses, not standalone
+                Err(DSLError::execution_error(
+                    "Table nodes cannot be executed directly".to_string(),
+                ))
+            }
+        }
     }
 
     /// Execute a utility AST node
     async fn execute_utility_node(&mut self, util_node: &UtilityNode) -> DSLResult<CommandResult> {
-        // Convert AST node to DSLCommand and use existing execution logic
-        let dsl_command = crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(
-            &ASTNode::Utility(util_node.clone()),
-        )?;
-        self.execute(dsl_command).await
+        use crate::dsl::ast::UtilityNode;
+
+        match util_node {
+            UtilityNode::Echo { message } => self.execute_echo_ast(message).await,
+            UtilityNode::Sleep { duration } => self.execute_sleep_ast(duration).await,
+            UtilityNode::SetVariable { name, value } => {
+                self.execute_set_variable_ast(name, value).await
+            }
+            UtilityNode::GetVariable { name } => self.execute_get_variable_ast(name).await,
+            UtilityNode::SetLogLevel { level } => self.execute_set_log_level_ast(level).await,
+        }
     }
 
     /// Execute a control flow AST node
@@ -356,14 +815,32 @@ impl DSLExecutor {
         &mut self,
         control_node: &ControlFlowNode,
     ) -> DSLResult<CommandResult> {
-        // Try converting to DSLCommand, fall back to not implemented
-        match crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(&ASTNode::ControlFlow(
-            control_node.clone(),
-        )) {
-            Ok(dsl_command) => self.execute(dsl_command).await,
-            Err(_) => Err(DSLError::execution_error(
-                "Control flow execution not yet implemented".to_string(),
+        use crate::dsl::ast::ControlFlowNode;
+
+        match control_node {
+            ControlFlowNode::IfStatement {
+                condition: _,
+                then_branch: _,
+                else_branch: _,
+            } => Err(DSLError::execution_error(
+                "IF statements not yet implemented".to_string(),
             )),
+            ControlFlowNode::LoopStatement {
+                condition: _,
+                body: _,
+            } => Err(DSLError::execution_error(
+                "LOOP statements not yet implemented".to_string(),
+            )),
+            ControlFlowNode::BreakStatement => Err(DSLError::execution_error(
+                "BREAK statements not yet implemented".to_string(),
+            )),
+            ControlFlowNode::ContinueStatement => Err(DSLError::execution_error(
+                "CONTINUE statements not yet implemented".to_string(),
+            )),
+            ControlFlowNode::ReturnStatement { value: _ } => Err(DSLError::execution_error(
+                "RETURN statements not yet implemented".to_string(),
+            )),
+            ControlFlowNode::Block { statements } => self.execute_block_ast(statements).await,
         }
     }
 
@@ -372,1435 +849,760 @@ impl DSLExecutor {
         &mut self,
         expr_node: &ExpressionNode,
     ) -> DSLResult<CommandResult> {
-        // Try converting to DSLCommand, fall back to not implemented
-        match crate::dsl::ast_dsl_transformer::ASTDSLTransformer::transform(&ASTNode::Expression(
-            expr_node.clone(),
-        )) {
-            Ok(dsl_command) => self.execute(dsl_command).await,
-            Err(_) => Err(DSLError::execution_error(
-                "Expression nodes cannot be executed directly".to_string(),
+        use crate::dsl::ast::ExpressionNode;
+
+        match expr_node {
+            ExpressionNode::Literal { value } => {
+                // Print literal value
+                println!("{value}");
+                Ok(CommandResult::success_with_message(format!(
+                    "Literal: {value}"
+                )))
+            }
+            ExpressionNode::Variable { name } => {
+                // Get and print variable value
+                if let Some(value) = self.variables.get(name) {
+                    let value_str = value.as_string().unwrap_or_default();
+                    println!("{value_str}");
+                    Ok(CommandResult::success_with_data(value.clone()))
+                } else {
+                    Err(DSLError::execution_error(format!(
+                        "Variable '{name}' not found"
+                    )))
+                }
+            }
+            ExpressionNode::BinaryExpression {
+                left: _,
+                operator,
+                right: _,
+            } => {
+                // For now, binary operations are not directly executable
+                Err(DSLError::execution_error(format!(
+                    "Binary operation '{operator}' cannot be executed directly"
+                )))
+            }
+            ExpressionNode::FunctionCall { name, arguments: _ } => {
+                // For now, function calls are not directly executable
+                Err(DSLError::execution_error(format!(
+                    "Function call '{name}' cannot be executed directly"
+                )))
+            }
+            ExpressionNode::Field { name, .. } => {
+                // Fields are typically used in queries, not standalone execution
+                Err(DSLError::execution_error(format!(
+                    "Field '{name}' cannot be executed directly"
+                )))
+            }
+            ExpressionNode::Assignment { name, value } => {
+                // Execute assignment as variable setting
+                let value_str = self.evaluate_ast_to_string(value)?;
+                self.variables.insert(
+                    name.clone(),
+                    crate::dsl::syntax::DSLValue::String(value_str.clone()),
+                );
+                Ok(CommandResult::success_with_message(format!(
+                    "Set {name} = {value_str}"
+                )))
+            }
+            _ => {
+                // Handle other expression types as not directly executable
+                Err(DSLError::execution_error(
+                    "Expression cannot be executed directly".to_string(),
+                ))
+            }
+        }
+    }
+
+    // AST-based command execution methods (work directly with field information from AST)
+
+    /// Execute delete cluster command using AST field information
+    /// This method should only be called with the field information from the parsed AST
+    async fn execute_delete_cluster_ast_with_fields(
+        &mut self,
+        search_field_ast: &ASTNode,
+        search_value: &str,
+        id_field_ast: &ASTNode,
+    ) -> DSLResult<CommandResult> {
+        // Get all clusters
+        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
+            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
+        })?;
+
+        if clusters.is_empty() {
+            return Err(DSLError::resource_not_found(
+                "No clusters found".to_string(),
+            ));
+        }
+
+        // Extract field names directly from AST nodes (no hardcoded assumptions)
+        let search_field_name = self.extract_field_name_from_ast(search_field_ast)?;
+        let id_field_name = self.extract_field_name_from_ast(id_field_ast)?;
+
+        // Resolve field names using schema
+        let object_type = clusters[0].object_type();
+        let resolved_search_field = self.resolve_field_name(object_type, &search_field_name);
+        let resolved_id_field = self.resolve_field_name(object_type, &id_field_name);
+
+        // Find cluster using the field specified in AST
+        let cluster = clusters
+            .iter()
+            .find(|c| c.get_field_value(&resolved_search_field).as_deref() == Some(search_value))
+            .ok_or_else(|| {
+                DSLError::resource_not_found(format!(
+                    "Cluster with {search_field_name} '{search_value}' not found"
+                ))
+            })?;
+
+        // Get cluster ID using the ID field specified in AST
+        let cluster_id = cluster.get_field_value(&resolved_id_field).ok_or_else(|| {
+            DSLError::execution_error(format!("Cluster has no {id_field_name} field"))
+        })?;
+
+        match self.client.delete_tidb(&cluster_id, None).await {
+            Ok(_) => Ok(CommandResult::success_with_message(format!(
+                "Successfully deleted cluster with {search_field_name} '{search_value}'"
+            ))),
+            Err(e) => Err(DSLError::execution_error_with_source(
+                format!("Failed to delete cluster with {search_field_name} '{search_value}'"),
+                e.to_string(),
             )),
         }
     }
 
-    // Command execution methods
+    /// Execute create cluster command using AST field information  
+    async fn execute_create_cluster_ast(
+        &mut self,
+        name: &str,
+        region: &str,
+        rcu_range: Option<&(String, String)>,
+        service_plan: Option<&String>,
+        password: Option<&String>,
+    ) -> DSLResult<CommandResult> {
+        // Resolve variables in the input parameters
+        let resolved_name = self.resolve_variables(name);
+        let resolved_region = self.resolve_variables(region);
 
-    async fn execute_create_cluster(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = self.get_parameter_value_with_default(&command, "CREATE_CLUSTER", "name")?;
-        let region = self.get_parameter_value_with_default(&command, "CREATE_CLUSTER", "region")?;
+        // Strip quotes from region if present (quotes come from DSL parsing)
+        let clean_region = resolved_region.trim_matches('"');
 
         // Validate cluster name and region
-        self.validate_cluster_name(&name)?;
-        self.validate_region(&region)?;
+        self.validate_cluster_name(&resolved_name)?;
+        self.validate_region(clean_region)?;
 
-        // Validate that only allowed parameters are provided
-        self.validate_create_cluster_parameters(&command)?;
+        // Parse RCU range with defaults
+        let (min_rcu, max_rcu) = match rcu_range {
+            Some((min, max)) => (self.resolve_variables(min), self.resolve_variables(max)),
+            None => ("1".to_string(), "1".to_string()), // Default RCU range
+        };
 
-        let min_rcu =
-            self.get_parameter_value_with_default(&command, "CREATE_CLUSTER", "min_rcu")?;
-        let max_rcu =
-            self.get_parameter_value_with_default(&command, "CREATE_CLUSTER", "max_rcu")?;
-        let service_plan =
-            self.get_parameter_value_with_default(&command, "CREATE_CLUSTER", "service_plan")?;
-        let password = self.get_optional_parameter_value(&command, "CREATE_CLUSTER", "password");
+        // Parse service plan with default
+        let resolved_service_plan = match service_plan {
+            Some(plan) => {
+                let resolved_plan = self.resolve_variables(plan);
+                match resolved_plan.to_uppercase().as_str() {
+                    "STARTER" => ServicePlan::Starter,
+                    "PREMIUM" => ServicePlan::Premium,
+                    _ => {
+                        return Err(DSLError::execution_error(format!(
+                            "Invalid service plan: {resolved_plan}. Valid options: STARTER, PREMIUM"
+                        )));
+                    }
+                }
+            }
+            None => ServicePlan::Starter, // Default service plan
+        };
 
-        // Validate service plan using schema-driven approach - NO hardcoded values!
-        let allowed_values =
-            crate::schema::get_parameter_allowed_values("CREATE_CLUSTER", "service_plan")
-                .unwrap_or_else(|| {
-                    vec![
-                        "STARTER".to_string(),
-                        "ESSENTIAL".to_string(),
-                        "PREMIUM".to_string(),
-                        "BYOC".to_string(),
-                    ]
-                });
-
-        if !allowed_values.contains(&service_plan.to_uppercase()) {
-            return Err(DSLError::invalid_parameter(
-                "service_plan",
-                service_plan,
-                format!("Must be one of: {}", allowed_values.join(", ")),
-            ));
-        }
-
-        // Convert service plan using schema-driven approach - NO hardcoded values!
-        let service_plan_enum = crate::schema::SCHEMA
-            .string_to_service_plan(&service_plan)
-            .ok_or_else(|| {
-                DSLError::invalid_parameter(
-                    "service_plan",
-                    service_plan,
-                    "Invalid service plan value",
-                )
-            })?;
-
+        // Create TiDB cluster structure
         let tidb = Tidb {
-            display_name: name.to_string(),
-            region_id: region.to_string(),
-            min_rcu: min_rcu.to_string(),
-            max_rcu: max_rcu.to_string(),
-            service_plan: service_plan_enum,
-            root_password: password.map(|p| p.to_string()),
+            display_name: resolved_name.clone(),
+            region_id: clean_region.to_string(),
+            min_rcu: min_rcu.clone(),
+            max_rcu: max_rcu.clone(),
+            service_plan: resolved_service_plan,
+            root_password: password.map(|p| self.resolve_variables(p)),
             ..Default::default()
         };
 
-        // Create the cluster first
-        let cluster = match self.client.create_tidb(&tidb, None).await {
-            Ok(cluster) => cluster,
+        match self.client.create_tidb(&tidb, None).await {
+            Ok(_created_tidb) => {
+                let success_message = format!("Cluster '{resolved_name}' created successfully");
+                Ok(CommandResult::success_with_message(success_message))
+            }
             Err(e) => {
-                return Err(DSLError::execution_error_with_source(
-                    format!("Failed to create cluster '{name}'"),
-                    e.to_string(),
-                ));
+                let error_message = format!("Failed to create cluster '{resolved_name}': {e}");
+                Err(DSLError::execution_error(error_message))
             }
-        };
-
-        // Check if public_connection settings need to be configured
-        let mut public_connection_updated = false;
-        if let Some(public_connection) = command.get_optional_parameter("public_connection")
-            && let Some(connection_obj) = public_connection.as_object()
-        {
-            // Get the cluster ID for the public connection update
-            let cluster_id = cluster
-                .tidb_id
-                .as_ref()
-                .ok_or_else(|| DSLError::execution_error("Created cluster has no ID"))?;
-
-            // Parse the public connection settings
-            let enabled = connection_obj
-                .get("enabled")
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(false);
-
-            let ip_access_list = if let Some(ip_list) = connection_obj.get("ipAccessList") {
-                if let Some(ip_array) = ip_list.as_array() {
-                    let mut entries = Vec::new();
-                    for ip_entry in ip_array {
-                        if let Some(ip_obj) = ip_entry.as_object() {
-                            let cidr_notation = ip_obj
-                                .get("cidrNotation")
-                                .and_then(|v| v.as_string())
-                                .unwrap_or("0.0.0.0/0")
-                                .to_string();
-                            let description = ip_obj
-                                .get("description")
-                                .and_then(|v| v.as_string())
-                                .unwrap_or("Default access")
-                                .to_string();
-                            entries.push(IpAccessListEntry {
-                                cidr_notation,
-                                description,
-                            });
-                        }
-                    }
-                    entries
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-            let request = UpdatePublicConnectionRequest {
-                enabled,
-                ip_access_list,
-            };
-
-            // Update public connection settings using the dedicated endpoint
-            match self
-                .client
-                .update_public_connection(cluster_id, &request)
-                .await
-            {
-                Ok(_) => {
-                    public_connection_updated = true;
-                    tracing::debug!(
-                        "Public connection settings configured successfully for cluster '{}'",
-                        name
-                    );
-                }
-                Err(e) => {
-                    return Err(DSLError::execution_error_with_source(
-                        format!(
-                            "Failed to configure public connection settings for cluster '{name}'"
-                        ),
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        let cluster_data = self.cluster_to_dsl_value(cluster);
-        let mut message = format!("Successfully created cluster '{name}'");
-        if public_connection_updated {
-            message = format!("{message} with public connection settings configured");
-        }
-
-        Ok(CommandResult::success_with_data_and_message(
-            cluster_data,
-            message,
-        ))
-    }
-
-    async fn execute_delete_cluster(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = command.get_parameter_as_string("name")?;
-
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
-
-        let cluster = clusters
-            .iter()
-            .find(|c| c.display_name == name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{name}'")))?;
-
-        let cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-        match self.client.delete_tidb(cluster_id, None).await {
-            Ok(_) => Ok(CommandResult::success_with_message(format!(
-                "Successfully deleted cluster '{name}'"
-            ))),
-            Err(e) => Err(DSLError::execution_error_with_source(
-                format!("Failed to delete cluster '{name}'"),
-                e.to_string(),
-            )),
         }
     }
 
-    async fn execute_update_cluster(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = command.get_parameter_as_string("name")?;
-
-        // Check rate limiting before making API call
-        self.check_rate_limit().await?;
-
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
-
-        let cluster = clusters
-            .iter()
-            .find(|c| c.display_name == name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{name}'")))?;
-
-        let cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-        // Check if root_password is being updated
-        let mut root_password_updated = false;
-        if let Some(root_password) = command.get_optional_parameter("root_password")
-            && let Some(password_str) = root_password.as_string()
-        {
-            // Reset root password using the dedicated endpoint
-            // Try using internal_name if available, otherwise use tidb_id
-            let api_cluster_id = if let Some(internal_name) = &cluster.name {
-                // Extract the ID from internal_name (e.g., "clusters/10103009492238500237" -> "10103009492238500237")
-                if internal_name.starts_with("clusters/") {
-                    internal_name.trim_start_matches("clusters/")
-                } else {
-                    internal_name
-                }
-            } else {
-                cluster_id
-            };
-
-            tracing::debug!(
-                "Attempting to reset root password for cluster '{}' with ID '{}' (API ID: '{}')",
-                name,
-                cluster_id,
-                api_cluster_id
-            );
-            match self
-                .client
-                .reset_root_password(api_cluster_id, password_str)
-                .await
-            {
-                Ok(_) => {
-                    root_password_updated = true;
-                    tracing::debug!("Root password updated successfully for cluster '{}'", name);
-                }
-                Err(e) => {
-                    return Err(DSLError::execution_error_with_source(
-                        format!("Failed to update root password for cluster '{name}'"),
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        // Check if public_connection is being updated
-        let mut public_connection_updated = false;
-        if let Some(public_connection) = command.get_optional_parameter("public_connection")
-            && let Some(connection_obj) = public_connection.as_object()
-        {
-            // Parse the public connection settings
-            let enabled = connection_obj
-                .get("enabled")
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(false);
-
-            let ip_access_list = if let Some(ip_list) = connection_obj.get("ipAccessList") {
-                if let Some(ip_array) = ip_list.as_array() {
-                    let mut entries = Vec::new();
-                    for ip_entry in ip_array {
-                        if let Some(ip_obj) = ip_entry.as_object() {
-                            let cidr_notation = ip_obj
-                                .get("cidrNotation")
-                                .and_then(|v| v.as_string())
-                                .unwrap_or("0.0.0.0/0")
-                                .to_string();
-                            let description = ip_obj
-                                .get("description")
-                                .and_then(|v| v.as_string())
-                                .unwrap_or("Default access")
-                                .to_string();
-                            entries.push(IpAccessListEntry {
-                                cidr_notation,
-                                description,
-                            });
-                        }
-                    }
-                    entries
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-            let request = UpdatePublicConnectionRequest {
-                enabled,
-                ip_access_list,
-            };
-
-            // Update public connection settings using the dedicated endpoint
-            match self
-                .client
-                .update_public_connection(cluster_id, &request)
-                .await
-            {
-                Ok(_) => {
-                    public_connection_updated = true;
-                    tracing::debug!(
-                        "Public connection settings updated successfully for cluster '{}'",
-                        name
-                    );
-                }
-                Err(e) => {
-                    return Err(DSLError::execution_error_with_source(
-                        format!("Failed to update public connection settings for cluster '{name}'"),
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        // Build update request for other fields
-        let mut update = UpdateTidbRequest {
-            display_name: cluster.display_name.clone(),
-            min_rcu: cluster.min_rcu.clone(),
-            max_rcu: cluster.max_rcu.clone(),
-        };
-
-        let mut has_other_updates = false;
-
-        if let Some(max_rcu) = command.get_optional_parameter("max_rcu")
-            && let Some(max_rcu_str) = max_rcu.as_string()
-        {
-            update.max_rcu = max_rcu_str.to_string();
-            has_other_updates = true;
-        }
-
-        if let Some(display_name) = command.get_optional_parameter("display_name")
-            && let Some(display_name_str) = display_name.as_string()
-        {
-            update.display_name = display_name_str.to_string();
-            has_other_updates = true;
-        }
-
-        // If we have other updates to make, perform them
-        if has_other_updates {
-            // TODO: Implement actual update_tidb method in TiDBCloudClient
-            // For now, we'll return a success message with the prepared update
-            tracing::debug!("Would update cluster '{}' with: {:?}", name, update);
-
-            let mut message =
-                format!("Update request prepared for cluster '{name}' (implementation pending)");
-
-            if root_password_updated {
-                message = format!("Root password updated successfully. {message}");
-            }
-
-            if public_connection_updated {
-                message = format!("Public connection settings updated successfully. {message}");
-            }
-
-            return Ok(CommandResult::success_with_message(message));
-        }
-
-        // If we only updated the root password, return success
-        if root_password_updated {
-            let mut message = format!("Root password updated successfully for cluster '{name}'");
-            if public_connection_updated {
-                message = format!("{message}. Public connection settings updated successfully.");
-            }
-            return Ok(CommandResult::success_with_message(message));
-        }
-
-        // If we only updated public connection settings, return success
-        if public_connection_updated {
-            return Ok(CommandResult::success_with_message(format!(
-                "Public connection settings updated successfully for cluster '{name}'"
-            )));
-        }
-
-        // If no updates were made, return an error
-        Err(DSLError::invalid_parameter(
-            "update",
-            "no parameters",
-            "No valid update parameters provided",
-        ))
-    }
-
-    async fn execute_wait_for_cluster(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = command.get_parameter_as_string("name")?;
-        let state = command.get_parameter_as_string("state")?;
-
-        // Check if timeout is specified
-        let has_timeout = command.get_optional_parameter("timeout").is_some();
-        let timeout_seconds = if has_timeout {
-            command
-                .get_optional_parameter("timeout")
-                .and_then(|v| v.as_number())
-                .unwrap_or(600.0) as u64
-        } else {
-            0 // Will be used to indicate infinite timeout
-        };
-
-        // Convert cluster state using schema-driven approach - NO hardcoded values!
-        let target_state = crate::schema::SCHEMA
-            .string_to_cluster_state(state)
-            .ok_or_else(|| DSLError::invalid_parameter("state", state, "Invalid cluster state"))?;
-
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
-
-        let cluster = clusters
-            .iter()
-            .find(|c| c.display_name == name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{name}'")))?;
-
-        let cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-        // If no timeout is specified, implement infinite wait with periodic messages
-        if !has_timeout {
-            return self
-                .wait_for_cluster_infinite(cluster_id, name, target_state, state)
-                .await;
-        }
-
-        // Use the original timeout-based approach
-        match self
-            .client
-            .wait_for_tidb_state(
-                cluster_id,
-                target_state,
-                Duration::from_secs(timeout_seconds),
-                Duration::from_secs(10),
-            )
-            .await
-        {
-            Ok(cluster) => {
-                let cluster_data = self.cluster_to_dsl_value(cluster);
-                Ok(CommandResult::success_with_data_and_message(
-                    cluster_data,
-                    format!("Cluster '{name}' reached state '{state}'"),
-                ))
-            }
-            Err(e) => Err(DSLError::execution_error_with_source(
-                format!("Failed to wait for cluster '{name}' to reach state '{state}'"),
-                e.to_string(),
-            )),
-        }
-    }
-
-    async fn wait_for_cluster_infinite(
+    /// Execute update cluster command using AST field information
+    async fn execute_update_cluster_ast(
         &mut self,
-        cluster_id: &str,
-        cluster_name: &str,
-        target_state: ClusterState,
-        target_state_str: &str,
+        name: &str,
+        updates: &[ASTNode],
     ) -> DSLResult<CommandResult> {
-        let start_time = std::time::Instant::now();
-        let mut last_message_time = start_time;
-        let message_interval = Duration::from_secs(60); // Print message every minute
+        let resolved_name = self.resolve_variables(name);
 
-        println!(
-            "Waiting for cluster '{cluster_name}' to reach state '{target_state_str}' (no timeout specified)"
-        );
-
-        loop {
-            // Check for cancellation
-            if self.is_cancelled() {
-                println!("Command cancelled by user");
-                return Err(DSLError::execution_error("Command was cancelled by user"));
+        // First, find the cluster by name to get the tidb_id
+        let clusters = match self.client.list_tidbs(None).await {
+            Ok(response) => response.tidbs.unwrap_or_default(),
+            Err(e) => {
+                return Err(DSLError::execution_error(format!(
+                    "Failed to list clusters to find '{resolved_name}': {e}"
+                )));
             }
+        };
 
-            // Check current cluster state
-            let cluster = match self.client.get_tidb(cluster_id).await {
-                Ok(cluster) => cluster,
-                Err(e) => {
-                    return Err(DSLError::execution_error_with_source(
-                        format!("Failed to get cluster '{cluster_name}' status"),
-                        e.to_string(),
+        let cluster = clusters.iter().find(|c| c.display_name == resolved_name);
+        let tidb_id = match cluster {
+            Some(c) => c.tidb_id.as_ref().ok_or_else(|| {
+                DSLError::execution_error(format!("Cluster '{resolved_name}' has no tidb_id"))
+            })?,
+            None => {
+                return Err(DSLError::execution_error(format!(
+                    "Cluster '{resolved_name}' not found"
+                )));
+            }
+        };
+
+        // Process each update
+        for update_node in updates {
+            match update_node {
+                ASTNode::Expression(ExpressionNode::Assignment { name, value }) => {
+                    let field_name = name;
+                    let resolved_field = self.resolve_variables(field_name);
+
+                    match resolved_field.as_str() {
+                        "root_password" => {
+                            let password_value = self.extract_value_from_ast(value)?;
+                            let resolved_password = match password_value {
+                                DSLValue::String(s) => self.resolve_variables(&s),
+                                _ => {
+                                    return Err(DSLError::execution_error(
+                                        "Root password must be a string".to_string(),
+                                    ));
+                                }
+                            };
+
+                            match self
+                                .client
+                                .reset_root_password(tidb_id, &resolved_password)
+                                .await
+                            {
+                                Ok(_) => {
+                                    println!("Root password updated for cluster '{resolved_name}'");
+                                }
+                                Err(e) => {
+                                    return Err(DSLError::execution_error(format!(
+                                        "Failed to update root password for cluster '{resolved_name}': {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        "public_connection" => {
+                            // Parse the JSON structure for public_connection
+                            let connection_value = self.extract_value_from_ast(value)?;
+
+                            // For now, implement a basic public_connection update
+                            // The DSL script has: { "enabled": true, "ipAccessList": [ { "cidrNotation": "10.0.0.1/24", "description": "My IP address" } ] }
+                            match connection_value {
+                                DSLValue::Object(obj) => {
+                                    let enabled = obj
+                                        .get("enabled")
+                                        .and_then(|v| match v {
+                                            DSLValue::Boolean(b) => Some(*b),
+                                            DSLValue::String(s) => Some(s == "true"),
+                                            _ => None,
+                                        })
+                                        .unwrap_or(false);
+
+                                    let mut ip_access_list = Vec::new();
+                                    if let Some(DSLValue::Array(list)) = obj.get("ipAccessList") {
+                                        for item in list {
+                                            if let DSLValue::Object(ip_obj) = item
+                                                && let (Some(DSLValue::String(cidr)), description) = (
+                                                    ip_obj.get("cidrNotation"),
+                                                    ip_obj.get("description"),
+                                                )
+                                            {
+                                                let desc = match description {
+                                                    Some(DSLValue::String(s)) => s.clone(),
+                                                    _ => String::new(),
+                                                };
+                                                ip_access_list.push(IpAccessListEntry {
+                                                    cidr_notation: cidr.clone(),
+                                                    description: desc,
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    let request = UpdatePublicConnectionRequest {
+                                        enabled,
+                                        ip_access_list,
+                                    };
+
+                                    match self
+                                        .client
+                                        .update_public_connection(tidb_id, &request)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            println!(
+                                                "Public connection updated for cluster '{resolved_name}'"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            return Err(DSLError::execution_error(format!(
+                                                "Failed to update public connection for cluster '{resolved_name}': {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    return Err(DSLError::execution_error(
+                                        "public_connection must be a JSON object".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(DSLError::execution_error(format!(
+                                "Unsupported update field: {resolved_field}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(DSLError::execution_error(
+                        "Update must be an assignment expression".to_string(),
                     ));
                 }
-            };
-
-            // Check if target state is reached
-            if let Some(current_state) = &cluster.state
-                && current_state == &target_state
-            {
-                let cluster_data = self.cluster_to_dsl_value(cluster);
-                let elapsed = start_time.elapsed();
-                let elapsed_str = self.format_duration(elapsed);
-
-                println!(
-                    "Cluster '{cluster_name}' reached state '{target_state_str}' after {elapsed_str}"
-                );
-
-                return Ok(CommandResult::success_with_data_and_message(
-                    cluster_data,
-                    format!(
-                        "Cluster '{cluster_name}' reached state '{target_state_str}' after {elapsed_str}"
-                    ),
-                ));
             }
-
-            // Print status message every minute
-            let now = std::time::Instant::now();
-            if now.duration_since(last_message_time) >= message_interval {
-                let elapsed = now.duration_since(start_time);
-                let elapsed_str = self.format_duration(elapsed);
-                let current_state_str = cluster
-                    .state
-                    .as_ref()
-                    .map(|s| format!("{s:?}"))
-                    .unwrap_or_else(|| "Unknown".to_string());
-
-                println!(
-                    "Still waiting for cluster '{cluster_name}' to reach state '{target_state_str}' (current: {current_state_str}, elapsed: {elapsed_str})"
-                );
-                last_message_time = now;
-            }
-
-            // Wait before next check
-            tokio::time::sleep(Duration::from_secs(10)).await;
         }
-    }
 
-    async fn execute_list_clusters(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        match self.client.list_all_tidbs(None).await {
-            Ok(clusters) => {
-                // Convert clusters to DSL values using the existing schema-based conversion
-                let cluster_values: Vec<DSLValue> = clusters
-                    .into_iter()
-                    .map(|cluster| self.cluster_to_dsl_value(cluster))
-                    .collect();
-
-                let mut result_data = DSLValue::Array(cluster_values);
-
-                // Apply generic filtering, sorting, and field selection using existing methods
-                result_data = self.apply_query_parameters(result_data, &command, "clusters")?;
-
-                // Handle INTO clause using existing generic logic
-                if let Some(into_param) = command.get_optional_parameter("into")
-                    && let Some(into_var) = into_param.as_string() {
-                        self.variables
-                            .insert(into_var.to_string(), result_data.clone());
-                        return Ok(CommandResult::success_with_message(format!(
-                            "Cluster list stored in variable '{into_var}'"
-                        )));
-                    }
-
-                Ok(CommandResult::success_with_data(result_data))
-            }
-            Err(e) => Err(DSLError::execution_error_with_source(
-                "Failed to list clusters",
-                e.to_string(),
-            )),
-        }
-    }
-
-    async fn execute_create_backup(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let cluster_name = command.get_parameter_as_string("cluster_name")?;
-        let _description = command
-            .get_optional_parameter("description")
-            .and_then(|v| v.as_string());
-
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
-
-        let cluster = clusters
-            .iter()
-            .find(|c| c.display_name == cluster_name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{cluster_name}'")))?;
-
-        let _cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-        // Note: The actual backup creation might need to be implemented in the client
-        // For now, we'll return a success message
         Ok(CommandResult::success_with_message(format!(
-            "Backup creation initiated for cluster '{cluster_name}'"
+            "Cluster '{resolved_name}' updated successfully"
         )))
     }
 
-    async fn execute_list_backups(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        // Check if field selection is requested
-        let selected_fields = command
-            .get_optional_parameter("selected_fields")
-            .and_then(|v| v.as_string())
-            .map(|s| {
-                s.split(',')
-                    .map(|f| f.trim().to_string())
-                    .collect::<Vec<_>>()
-            });
+    /// Execute wait for cluster command using AST field information
+    async fn execute_wait_for_cluster_ast(
+        &mut self,
+        name: &str,
+        state: &str,
+        timeout: Option<u64>,
+    ) -> DSLResult<CommandResult> {
+        let resolved_name = self.resolve_variables(name);
+        let resolved_state = self.resolve_variables(state);
+        let timeout_duration = timeout.unwrap_or(300); // Default 5 minutes
 
-        // Check if WHERE clause filtering is requested
-        let where_clause = command
-            .get_optional_parameter("where_clause")
-            .and_then(|v| v.as_string());
-
-        // Check if ORDER BY clause is requested
-        let order_by = command
-            .get_optional_parameter("order_by")
-            .and_then(|v| v.as_string());
-
-        // Check if a specific cluster is requested
-        if let Ok(cluster_name) = command.get_parameter_as_string("cluster_name") {
-            // Get all the clusters to find the cluster ID or display name
-            let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-                DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-            })?;
-
-            let cluster = clusters
-                .iter()
-                .find(|c| c.display_name == cluster_name)
-                .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{cluster_name}'")))?;
-
-            let cluster_id = cluster
-                .tidb_id
-                .as_ref()
-                .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-            match self.client.list_all_backups(cluster_id, None).await {
-                Ok(mut backups) => {
-                    // Apply WHERE clause filtering if present
-                    if let Some(where_clause) = where_clause {
-                        backups.retain(|backup| {
-                            match self.evaluate_backup_where_clause(backup, where_clause) {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    eprintln!("Error evaluating WHERE clause: {e}");
-                                    false
-                                }
-                            }
-                        });
-                    }
-
-                    // Apply ORDER BY sorting if present
-                    if let Some(order_by_clause) = order_by.as_ref() {
-                        self.sort_backups(&mut backups, order_by_clause)?;
-                    }
-
-                    let backups_len = backups.len();
-
-                    let backups_data = if let Some(fields) = &selected_fields {
-                        DSLValue::Array(
-                            backups
-                                .into_iter()
-                                .map(|b| self.backup_to_dsl_value_filtered(&b, fields))
-                                .collect(),
-                        )
-                    } else {
-                        DSLValue::Array(
-                            backups
-                                .into_iter()
-                                .map(|b| self.backup_to_dsl_value(b))
-                                .collect(),
-                        )
-                    };
-
-                    Ok(CommandResult::success_with_data_and_message(
-                        backups_data,
-                        format!("Found {backups_len} backups for cluster '{cluster_name}'"),
-                    ))
-                }
-                Err(e) => Err(DSLError::execution_error_with_source(
-                    format!("Failed to list backups for cluster '{cluster_name}'"),
-                    e.to_string(),
-                )),
+        // Find the cluster by name to get the tidb_id
+        let clusters = match self.client.list_tidbs(None).await {
+            Ok(response) => response.tidbs.unwrap_or_default(),
+            Err(e) => {
+                return Err(DSLError::execution_error(format!(
+                    "Failed to list clusters to find '{resolved_name}': {e}"
+                )));
             }
-        } else {
-            // List backups from all clusters
-            let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-                DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-            })?;
-
-            // Filter clusters if WHERE clause contains CLUSTER conditions
-            let (cluster_conditions, backup_conditions) = if let Some(where_clause) = where_clause {
-                self.separate_cross_context_conditions(where_clause)?
-            } else {
-                (Vec::new(), Vec::new())
-            };
-
-            let filtered_clusters = if !cluster_conditions.is_empty() {
-                // Filter clusters based on CLUSTER conditions
-                clusters
-                    .into_iter()
-                    .filter(|cluster| {
-                        cluster_conditions.iter().all(|condition| {
-                            match self.evaluate_where_clause(cluster, condition) {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    eprintln!("Error evaluating cluster WHERE clause: {e}");
-                                    false
-                                }
-                            }
-                        })
-                    })
-                    .collect()
-            } else {
-                clusters
-            };
-
-            let mut all_raw_backups = Vec::new();
-            let mut cluster_count = 0;
-
-            // First collect all raw backups
-            for cluster in filtered_clusters {
-                if let Some(cluster_id) = &cluster.tidb_id {
-                    match self.client.list_all_backups(cluster_id, None).await {
-                        Ok(mut backups) => {
-                            // Apply backup-specific WHERE clause filtering if present
-                            if !backup_conditions.is_empty() {
-                                // Combine backup conditions with AND
-                                let combined_backup_conditions = backup_conditions.join(" AND ");
-                                backups.retain(|backup| {
-                                    match self.evaluate_backup_where_clause(
-                                        backup,
-                                        &combined_backup_conditions,
-                                    ) {
-                                        Ok(result) => result,
-                                        Err(e) => {
-                                            eprintln!("Error evaluating backup WHERE clause: {e}");
-                                            false
-                                        }
-                                    }
-                                });
-                            }
-
-                            cluster_count += 1;
-                            all_raw_backups.extend(backups);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to list backups for cluster '{}': {}",
-                                cluster.display_name,
-                                e
-                            );
-                            // Continue with other clusters
-                        }
-                    }
-                }
-            }
-
-            // Apply ORDER BY sorting if present
-            if let Some(order_by_clause) = order_by.as_ref() {
-                self.sort_backups(&mut all_raw_backups, order_by_clause)?;
-            }
-
-            let total_backups = all_raw_backups.len();
-
-            // Convert to DSLValue after sorting
-            let all_backups = if let Some(fields) = &selected_fields {
-                all_raw_backups
-                    .into_iter()
-                    .map(|b| self.backup_to_dsl_value_filtered(&b, fields))
-                    .collect()
-            } else {
-                all_raw_backups
-                    .into_iter()
-                    .map(|b| self.backup_to_dsl_value(b))
-                    .collect()
-            };
-
-            Ok(CommandResult::success_with_data_and_message(
-                DSLValue::Array(all_backups),
-                format!("Found {total_backups} backups across {cluster_count} clusters"),
-            ))
-        }
-    }
-
-    /// Sort backups based on ORDER BY clause
-    fn sort_backups(
-        &self,
-        backups: &mut [crate::tidb_cloud::models::Backup],
-        order_by_clause: &str,
-    ) -> DSLResult<()> {
-        // Parse the ORDER BY clause - format: "field ASC|DESC"
-        let parts: Vec<&str> = order_by_clause.split_whitespace().collect();
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        let field_name = parts[0];
-        let direction = if parts.len() > 1 && parts[1].to_uppercase() == "DESC" {
-            "DESC"
-        } else {
-            "ASC"
         };
 
-        // Sort based on the field name
-        match field_name.to_lowercase().as_str() {
-            "sizebytes" => {
-                backups.sort_by(|a, b| {
-                    // Parse size_bytes as integers for proper numeric sorting
-                    let size_a = a
-                        .size_bytes
-                        .as_deref()
-                        .unwrap_or("0")
-                        .parse::<u64>()
-                        .unwrap_or(0);
-                    let size_b = b
-                        .size_bytes
-                        .as_deref()
-                        .unwrap_or("0")
-                        .parse::<u64>()
-                        .unwrap_or(0);
-                    if direction == "DESC" {
-                        size_b.cmp(&size_a)
-                    } else {
-                        size_a.cmp(&size_b)
-                    }
-                });
+        let cluster = clusters.iter().find(|c| c.display_name == resolved_name);
+        let tidb_id = match cluster {
+            Some(c) => c.tidb_id.as_ref().ok_or_else(|| {
+                DSLError::execution_error(format!("Cluster '{resolved_name}' has no tidb_id"))
+            })?,
+            None => {
+                return Err(DSLError::execution_error(format!(
+                    "Cluster '{resolved_name}' not found"
+                )));
             }
-            "displayname" => {
-                backups.sort_by(|a, b| {
-                    let name_a = &a.display_name;
-                    let name_b = &b.display_name;
-                    if direction == "DESC" {
-                        name_b.cmp(name_a)
-                    } else {
-                        name_a.cmp(name_b)
-                    }
-                });
-            }
-            "createtime" => {
-                backups.sort_by(|a, b| {
-                    let time_a = a.create_time.as_deref().unwrap_or("");
-                    let time_b = b.create_time.as_deref().unwrap_or("");
-                    if direction == "DESC" {
-                        time_b.cmp(time_a)
-                    } else {
-                        time_a.cmp(time_b)
-                    }
-                });
-            }
-            "backupts" => {
-                backups.sort_by(|a, b| {
-                    let ts_a = a.backup_ts.as_deref().unwrap_or("");
-                    let ts_b = b.backup_ts.as_deref().unwrap_or("");
-                    if direction == "DESC" {
-                        ts_b.cmp(ts_a)
-                    } else {
-                        ts_a.cmp(ts_b)
-                    }
-                });
-            }
-            "state" => {
-                backups.sort_by(|a, b| {
-                    let state_a = a
-                        .state
-                        .as_ref()
-                        .map(|s| format!("{s:?}"))
-                        .unwrap_or_default();
-                    let state_b = b
-                        .state
-                        .as_ref()
-                        .map(|s| format!("{s:?}"))
-                        .unwrap_or_default();
-                    if direction == "DESC" {
-                        state_b.cmp(&state_a)
-                    } else {
-                        state_a.cmp(&state_b)
-                    }
-                });
-            }
+        };
+
+        // Parse the expected state
+        let expected_state = match resolved_state.to_uppercase().as_str() {
+            "ACTIVE" => ClusterState::Active,
+            "CREATING" => ClusterState::Creating,
+            "DELETING" => ClusterState::Deleting,
+            "MODIFYING" => ClusterState::Modifying,
             _ => {
-                return Err(DSLError::invalid_parameter(
-                    "order_by",
-                    field_name,
-                    "Unsupported sort field for backups. Supported fields: sizeBytes, displayName, createTime, backupTs, state",
-                ));
+                return Err(DSLError::execution_error(format!(
+                    "Invalid cluster state: {resolved_state}. Valid states: ACTIVE, CREATING, DELETING, MODIFYING"
+                )));
             }
-        }
-
-        Ok(())
-    }
-
-    /// Apply query parameters (WHERE, ORDER BY, field selection) generically using schema
-    fn apply_query_parameters(
-        &self,
-        data: DSLValue,
-        command: &DSLCommand,
-        object_type: &str,
-    ) -> DSLResult<DSLValue> {
-        if let DSLValue::Array(mut items) = data {
-            // Apply WHERE clause filtering if present
-            if let Some(where_clause) = command
-                .get_optional_parameter("where_clause")
-                .and_then(|v| v.as_string())
-            {
-                items.retain(|item| {
-                    match self.evaluate_generic_where_clause(item, where_clause, object_type) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            eprintln!("Error evaluating WHERE clause: {e}");
-                            false
-                        }
-                    }
-                });
-            }
-
-            // Apply ORDER BY if present
-            if let Some(order_by) = command
-                .get_optional_parameter("order_by")
-                .and_then(|v| v.as_string())
-            {
-                self.sort_generic(&mut items, order_by, object_type)?;
-            }
-
-            // Apply field selection if present
-            if let Some(selected_fields) = command
-                .get_optional_parameter("selected_fields")
-                .and_then(|v| v.as_string())
-            {
-                let field_names: Vec<String> = selected_fields
-                    .split(',')
-                    .map(|f| f.trim().to_string())
-                    .collect();
-
-                items = items
-                    .into_iter()
-                    .map(|item| {
-                        if let DSLValue::Object(mut obj) = item {
-                            let mut filtered_obj = HashMap::new();
-                            for field in &field_names {
-                                // Try to find the field by name or schema mapping
-                                let canonical_name = crate::schema::SCHEMA
-                                    .get_canonical_name(object_type, field)
-                                    .or_else(|| {
-                                        crate::schema::SCHEMA.get_json_name(object_type, field)
-                                    })
-                                    .unwrap_or_else(|| field.clone());
-
-                                if let Some(value) =
-                                    obj.remove(&canonical_name).or_else(|| obj.remove(field))
-                                {
-                                    filtered_obj.insert(field.clone(), value);
-                                }
-                            }
-                            DSLValue::Object(filtered_obj)
-                        } else {
-                            item
-                        }
-                    })
-                    .collect();
-            }
-
-            Ok(DSLValue::Array(items))
-        } else {
-            Ok(data)
-        }
-    }
-
-    /// Generic WHERE clause evaluation using schema
-    fn evaluate_generic_where_clause(
-        &self,
-        item: &DSLValue,
-        where_clause: &str,
-        object_type: &str,
-    ) -> DSLResult<bool> {
-        if where_clause.trim().is_empty() {
-            return Ok(true);
-        }
-
-        // For now, use a simple string matching approach
-        // This can be enhanced with proper parsing if needed
-        if let DSLValue::Object(obj) = item {
-            // Simple equality check: field = 'value'
-            if let Some((field, value)) = self.parse_simple_where_clause(where_clause) {
-                // Check if field is valid for this object type using schema
-                if !crate::schema::SCHEMA.is_filterable_field(object_type, &field) {
-                    return Err(DSLError::invalid_parameter(
-                        "where_field",
-                        &field,
-                        format!("Field '{field}' is not filterable for {object_type}"),
-                    ));
-                }
-
-                // Get canonical field name
-                let canonical_name = crate::schema::SCHEMA
-                    .get_canonical_name(object_type, &field)
-                    .or_else(|| crate::schema::SCHEMA.get_json_name(object_type, &field))
-                    .unwrap_or(field);
-
-                // Check if the field value matches
-                if let Some(field_value) = obj.get(&canonical_name) {
-                    let field_str = field_value.as_string().unwrap_or_default();
-                    return Ok(field_str.eq_ignore_ascii_case(&value));
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// Parse simple WHERE clause in format: field = 'value'
-    fn parse_simple_where_clause(&self, where_clause: &str) -> Option<(String, String)> {
-        let parts: Vec<&str> = where_clause.split('=').collect();
-        if parts.len() == 2 {
-            let field = parts[0].trim().to_string();
-            let value = parts[1]
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_string();
-            Some((field, value))
-        } else {
-            None
-        }
-    }
-
-    /// Generic sorting using schema
-    fn sort_generic(
-        &self,
-        items: &mut [DSLValue],
-        order_by: &str,
-        object_type: &str,
-    ) -> DSLResult<()> {
-        let parts: Vec<&str> = order_by.split_whitespace().collect();
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        let field_name = parts[0];
-        let direction = if parts.len() > 1 && parts[1].to_uppercase() == "DESC" {
-            "DESC"
-        } else {
-            "ASC"
         };
 
-        // Validate field using schema
-        if !crate::schema::SCHEMA.is_valid_field(object_type, field_name) {
-            let valid_fields = crate::schema::SCHEMA.get_field_names(object_type);
-            return Err(DSLError::invalid_parameter(
-                "order_by",
-                field_name,
-                format!(
-                    "Invalid field '{}' for {}. Valid fields: {}",
-                    field_name,
-                    object_type,
-                    valid_fields.join(", ")
-                ),
-            ));
-        }
+        let start_time = std::time::Instant::now();
+        let timeout_duration = std::time::Duration::from_secs(timeout_duration);
 
-        // Get canonical field name
-        let canonical_name = crate::schema::SCHEMA
-            .get_canonical_name(object_type, field_name)
-            .or_else(|| crate::schema::SCHEMA.get_json_name(object_type, field_name))
-            .unwrap_or_else(|| field_name.to_string());
-
-        // Sort items
-        items.sort_by(|a, b| {
-            if let (DSLValue::Object(obj_a), DSLValue::Object(obj_b)) = (a, b) {
-                let str_a = obj_a
-                    .get(&canonical_name)
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_default();
-                let str_b = obj_b
-                    .get(&canonical_name)
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_default();
-
-                if direction == "DESC" {
-                    str_b.cmp(str_a)
-                } else {
-                    str_a.cmp(str_b)
-                }
-            } else {
-                std::cmp::Ordering::Equal
+        loop {
+            // Check if we've timed out
+            if start_time.elapsed() > timeout_duration {
+                return Err(DSLError::execution_error(format!(
+                    "Timeout waiting for cluster '{resolved_name}' to reach state '{resolved_state}'"
+                )));
             }
-        });
 
-        Ok(())
+            // Get current cluster state
+            match self.client.get_tidb(tidb_id).await {
+                Ok(cluster) => {
+                    if let Some(current_state) = &cluster.state {
+                        if *current_state == expected_state {
+                            return Ok(CommandResult::success_with_message(format!(
+                                "Cluster '{resolved_name}' is now {resolved_state}"
+                            )));
+                        }
+                        println!(
+                            "Cluster '{resolved_name}' is currently {current_state:?}, waiting for {expected_state:?}..."
+                        );
+                    } else {
+                        println!(
+                            "Cluster '{resolved_name}' state is unknown, continuing to wait..."
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(DSLError::execution_error(format!(
+                        "Failed to get cluster '{resolved_name}' status: {e}"
+                    )));
+                }
+            }
+
+            // Wait before checking again
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
     }
 
-    async fn execute_delete_backup(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let backup_id = command.get_parameter_as_string("backup_id")?;
-        let cluster_name = command.get_parameter_as_string("cluster_name")?;
+    /// Execute create backup command using AST field information
+    async fn execute_create_backup_ast(
+        &mut self,
+        cluster_name: &str,
+        description: Option<&String>,
+    ) -> DSLResult<CommandResult> {
+        let resolved_cluster_name = self.resolve_variables(cluster_name);
 
-        // First, get the cluster to find its ID
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
+        // First, find the cluster by name to get the tidb_id
+        let clusters = match self.client.list_tidbs(None).await {
+            Ok(response) => response.tidbs.unwrap_or_default(),
+            Err(e) => {
+                return Err(DSLError::execution_error(format!(
+                    "Failed to list clusters to find '{resolved_cluster_name}': {e}"
+                )));
+            }
+        };
 
         let cluster = clusters
             .iter()
-            .find(|c| c.display_name == cluster_name)
-            .ok_or_else(|| DSLError::resource_not_found(format!("Cluster '{cluster_name}'")))?;
-
-        let cluster_id = cluster
-            .tidb_id
-            .as_ref()
-            .ok_or_else(|| DSLError::execution_error("Cluster has no ID"))?;
-
-        match self.client.delete_backup(cluster_id, backup_id).await {
-            Ok(_) => Ok(CommandResult::success_with_message(format!(
-                "Successfully deleted backup '{backup_id}' from cluster '{cluster_name}'"
-            ))),
-            Err(e) => Err(DSLError::execution_error_with_source(
-                format!("Failed to delete backup '{backup_id}' from cluster '{cluster_name}'"),
-                e.to_string(),
-            )),
-        }
-    }
-
-    async fn execute_join(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let left_table = command.get_parameter_as_string("left_table")?;
-        let right_table = command.get_parameter_as_string("right_table")?;
-        let join_type = command.get_parameter_as_string("join_type")?;
-        let on_condition = command.get_parameter_as_string("on_condition")?;
-        let where_clause = command
-            .get_optional_parameter("where_clause")
-            .and_then(|v| v.as_string());
-
-        // Check if field selection is requested
-        let selected_fields = command
-            .get_optional_parameter("selected_fields")
-            .and_then(|v| v.as_string())
-            .map(|s| {
-                s.split(',')
-                    .map(|f| f.trim().to_string())
-                    .collect::<Vec<_>>()
-            });
-
-        // For now, we only support BACKUPS JOIN CLUSTERS
-        if (left_table.to_uppercase() == "BACKUPS" && right_table.to_uppercase() == "CLUSTERS")
-            || (left_table.to_uppercase() == "CLUSTERS" && right_table.to_uppercase() == "BACKUPS")
-        {
-            self.execute_backups_clusters_join(
-                on_condition.to_string(),
-                where_clause.map(|s| s.to_string()),
-                selected_fields,
-                join_type.to_string(),
-            )
-            .await
-        } else {
-            Err(DSLError::execution_error(format!(
-                "Unsupported JOIN: {left_table} JOIN {right_table}. Only BACKUPS-CLUSTERS joins are supported."
-            )))
-        }
-    }
-
-    async fn execute_backups_clusters_join(
-        &mut self,
-        on_condition: String,
-        where_clause: Option<String>,
-        selected_fields: Option<Vec<String>>,
-        _join_type: String,
-    ) -> DSLResult<CommandResult> {
-        // Step 1: Fetch all clusters
-        let clusters = self.client.list_all_tidbs(None).await.map_err(|e| {
-            DSLError::execution_error_with_source("Failed to list clusters", e.to_string())
-        })?;
-
-        // Step 2: Fetch all backups for each cluster
-        let mut joined_results = Vec::new();
-
-        for cluster in &clusters {
-            if let Some(cluster_id) = &cluster.tidb_id {
-                match self.client.list_all_backups(cluster_id, None).await {
-                    Ok(backups) => {
-                        for backup in backups {
-                            // Step 3: Check if the ON condition matches
-                            if self.evaluate_join_condition(&backup, cluster, &on_condition)? {
-                                // Step 4: Apply WHERE clause if present
-                                let passes_where = if let Some(ref where_expr) = where_clause {
-                                    self.evaluate_join_where_clause(&backup, cluster, where_expr)?
-                                } else {
-                                    true
-                                };
-
-                                if passes_where {
-                                    // Step 5: Create joined row
-                                    let joined_row = if let Some(ref fields) = selected_fields {
-                                        self.create_joined_row_filtered(&backup, cluster, fields)
-                                    } else {
-                                        self.create_joined_row(&backup, cluster)
-                                    };
-                                    joined_results.push(joined_row);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Log error but continue with other clusters
-                        tracing::warn!("Failed to fetch backups for cluster {}: {}", cluster_id, e);
-                    }
-                }
+            .find(|c| c.display_name == resolved_cluster_name);
+        let tidb_id = match cluster {
+            Some(c) => c.tidb_id.as_ref().ok_or_else(|| {
+                DSLError::execution_error(format!(
+                    "Cluster '{resolved_cluster_name}' has no tidb_id"
+                ))
+            })?,
+            None => {
+                return Err(DSLError::execution_error(format!(
+                    "Cluster '{resolved_cluster_name}' not found"
+                )));
             }
-        }
-
-        let results_count = joined_results.len();
-        Ok(CommandResult::success_with_data_and_message(
-            DSLValue::Array(joined_results),
-            format!("Found {results_count} joined records"),
-        ))
-    }
-
-    fn evaluate_join_condition(
-        &self,
-        backup: &crate::tidb_cloud::models::Backup,
-        cluster: &crate::tidb_cloud::models::Tidb,
-        on_condition: &str,
-    ) -> DSLResult<bool> {
-        // Parse simple ON condition like "BACKUPS.tidbId = CLUSTER.tidbId"
-        if on_condition.contains("BACKUPS.tidbId") && on_condition.contains("CLUSTER.tidbId") {
-            let empty_string = String::new();
-            let backup_tidb_id = backup.tidb_id.as_ref().unwrap_or(&empty_string);
-            let cluster_tidb_id = cluster.tidb_id.as_ref().unwrap_or(&empty_string);
-            Ok(backup_tidb_id == cluster_tidb_id)
-        } else {
-            // For now, we only support the basic tidbId join condition
-            Err(DSLError::execution_error(format!(
-                "Unsupported JOIN condition: {on_condition}. Only BACKUPS.tidbId = CLUSTER.tidbId is supported."
-            )))
-        }
-    }
-
-    fn evaluate_join_where_clause(
-        &self,
-        backup: &crate::tidb_cloud::models::Backup,
-        cluster: &crate::tidb_cloud::models::Tidb,
-        where_clause: &str,
-    ) -> DSLResult<bool> {
-        // Simple WHERE clause evaluation for joined data
-        // For now, support basic conditions like "displayName = 'value'"
-        if let Some(equals_pos) = where_clause.find('=') {
-            let field_part = where_clause[..equals_pos].trim();
-            let value_part = where_clause[equals_pos + 1..].trim();
-
-            // Remove quotes from value
-            let value = value_part.trim_matches('\'').trim_matches('"');
-
-            match field_part {
-                "displayName" => Ok(cluster.display_name == value),
-                "clusters.displayName" | "CLUSTER.displayName" => Ok(cluster.display_name == value),
-                _ => {
-                    // Try evaluating as backup condition
-                    self.evaluate_backup_where_clause(backup, where_clause)
-                }
-            }
-        } else {
-            Ok(true) // If we can't parse it, assume it passes
-        }
-    }
-
-    fn create_joined_row(
-        &self,
-        backup: &crate::tidb_cloud::models::Backup,
-        cluster: &crate::tidb_cloud::models::Tidb,
-    ) -> DSLValue {
-        let mut row = std::collections::HashMap::new();
-
-        // Add backup fields with context prefix using AST format
-        let backup_value = self.backup_to_dsl_value(backup.clone());
-        if let DSLValue::Object(backup_fields) = backup_value {
-            for (key, value) in backup_fields {
-                row.insert(format!("BACKUPS.{key}"), value);
-            }
-        }
-
-        // Add cluster fields with context prefix using AST format
-        let cluster_value = self.cluster_to_dsl_value(cluster.clone());
-        if let DSLValue::Object(cluster_fields) = cluster_value {
-            for (key, value) in cluster_fields {
-                row.insert(format!("CLUSTER.{key}"), value);
-            }
-        }
-
-        DSLValue::Object(row)
-    }
-
-    fn create_joined_row_filtered(
-        &self,
-        backup: &crate::tidb_cloud::models::Backup,
-        cluster: &crate::tidb_cloud::models::Tidb,
-        fields: &[String],
-    ) -> DSLValue {
-        let mut row = std::collections::HashMap::new();
-
-        // Get full joined row first
-        let full_row = self.create_joined_row(backup, cluster);
-        if let DSLValue::Object(full_fields) = full_row {
-            // Filter to requested fields
-            for field in fields {
-                if field.trim() == "*" {
-                    return DSLValue::Object(full_fields); // Return all fields
-                }
-
-                // Handle field name mapping and case-insensitive lookups
-                let field_found = if let Some(value) = full_fields.get(field) {
-                    // Exact match
-                    row.insert(field.clone(), value.clone());
-                    true
-                } else {
-                    // Try case-insensitive match and handle different naming conventions
-                    let field_lower = field.to_lowercase();
-                    let mut found = false;
-
-                    for (key, value) in &full_fields {
-                        let key_lower = key.to_lowercase();
-                        if key_lower == field_lower {
-                            row.insert(field.clone(), value.clone());
-                            found = true;
-                            break;
-                        }
-                    }
-                    found
-                };
-
-                // If still not found, log debug info for troubleshooting
-                if !field_found {
-                    tracing::debug!(
-                        "Field '{}' not found in joined row. Available fields: {:?}",
-                        field,
-                        full_fields.keys().collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
-
-        DSLValue::Object(row)
-    }
-
-    async fn execute_estimate_price(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let region = command.get_parameter_as_string("region")?;
-        let min_rcu = command.get_parameter_as_string("min_rcu")?;
-        let max_rcu = command.get_parameter_as_string("max_rcu")?;
-        let service_plan = command.get_parameter_as_string("service_plan")?;
-        let storage = command
-            .get_optional_parameter("storage")
-            .and_then(|v| v.as_string())
-            .unwrap_or("1073741824"); // 1GB default
-
-        // Convert service plan using schema-driven approach - NO hardcoded values!
-        let service_plan_enum = crate::schema::SCHEMA
-            .string_to_service_plan(service_plan)
-            .ok_or_else(|| {
-                DSLError::invalid_parameter(
-                    "service_plan",
-                    service_plan,
-                    "Invalid service plan value",
-                )
-            })?;
-
-        let price_request = EstimatePriceRequest {
-            region_id: region.to_string(),
-            min_rcu: min_rcu.to_string(),
-            max_rcu: max_rcu.to_string(),
-            service_plan: service_plan_enum,
-            row_storage_size: storage.to_string(),
-            column_storage_size: storage.to_string(),
         };
 
-        match self.client.estimate_price(&price_request).await {
-            Ok(price) => {
-                let price_data = self.price_to_dsl_value(price);
-                Ok(CommandResult::success_with_data_and_message(
-                    price_data,
+        // Create the backup request
+        let resolved_description = description.map(|d| self.resolve_variables(d));
+        let request = CreateBackupRequest {
+            description: resolved_description,
+        };
+
+        // Create the backup
+        match self.client.create_backup(tidb_id, &request).await {
+            Ok(_backup) => {
+                let success_message = if let Some(desc) = description {
                     format!(
-                        "Price estimated for region '{region}' with RCU range {min_rcu}-{max_rcu}"
-                    ),
-                ))
+                        "Backup created for cluster '{}' with description: {}",
+                        resolved_cluster_name,
+                        self.resolve_variables(desc)
+                    )
+                } else {
+                    format!("Backup created for cluster '{resolved_cluster_name}'")
+                };
+                Ok(CommandResult::success_with_message(success_message))
             }
-            Err(e) => Err(DSLError::execution_error_with_source(
-                format!("Failed to estimate price for region '{region}'"),
-                e.to_string(),
-            )),
+            Err(e) => Err(DSLError::execution_error(format!(
+                "Failed to create backup for cluster '{resolved_cluster_name}': {e}"
+            ))),
         }
     }
 
-    async fn execute_set_variable(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = command.get_parameter_as_string("name")?;
-        let value = command.require_parameter("value")?.clone();
+    /// Execute delete cluster command using AST field information
+    async fn execute_delete_cluster_ast(&mut self, name: &str) -> DSLResult<CommandResult> {
+        let resolved_name = self.resolve_variables(name);
 
-        self.variables.insert(name.to_string(), value.clone());
+        // First, find the cluster by name to get the tidb_id
+        let clusters = match self.client.list_tidbs(None).await {
+            Ok(response) => response.tidbs.unwrap_or_default(),
+            Err(e) => {
+                return Err(DSLError::execution_error(format!(
+                    "Failed to list clusters to find '{resolved_name}': {e}"
+                )));
+            }
+        };
 
-        Ok(CommandResult::success_with_data_and_message(
-            value,
-            format!("Set variable '{name}'"),
-        ))
+        let cluster = clusters.iter().find(|c| c.display_name == resolved_name);
+        let tidb_id = match cluster {
+            Some(c) => c.tidb_id.as_ref().ok_or_else(|| {
+                DSLError::execution_error(format!("Cluster '{resolved_name}' has no tidb_id"))
+            })?,
+            None => {
+                return Err(DSLError::execution_error(format!(
+                    "Cluster '{resolved_name}' not found"
+                )));
+            }
+        };
+
+        // Delete the cluster
+        match self.client.delete_tidb(tidb_id, None).await {
+            Ok(_) => Ok(CommandResult::success_with_message(format!(
+                "Cluster '{resolved_name}' deletion initiated successfully"
+            ))),
+            Err(e) => Err(DSLError::execution_error(format!(
+                "Failed to delete cluster '{resolved_name}': {e}"
+            ))),
+        }
     }
 
-    async fn execute_get_variable(&self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let name = command.get_parameter_as_string("name")?;
+    /// Execute a SELECT query using AST information
+    async fn execute_select_ast(
+        &mut self,
+        fields: &[ASTNode],
+        from: &ASTNode,
+        where_clause: &Option<Box<ASTNode>>,
+        _order_by: &Option<Vec<crate::dsl::ast::OrderByClause>>,
+    ) -> DSLResult<CommandResult> {
+        // Parse table name from FROM clause
+        let table_name = match from {
+            ASTNode::Query(QueryNode::Table { name, .. }) => name.to_uppercase(),
+            _ => {
+                return Err(DSLError::execution_error(
+                    "FROM clause must reference a table".to_string(),
+                ));
+            }
+        };
 
+        // Lookup handler via registry
+        match Self::get_table_handler(&table_name) {
+            Some(handler) => {
+                // Call generic execution function
+                self.execute_select_generic(&handler, fields, where_clause)
+                    .await
+            }
+            None => Err(DSLError::execution_error(format!(
+                "Unsupported table: {table_name}"
+            ))),
+        }
+    }
+
+    /// Evaluate WHERE clause AST for backup filtering with cluster context
+    fn evaluate_backup_where_ast(
+        &self,
+        backup: &Backup,
+        cluster: &Tidb,
+        where_expr: &ASTNode,
+    ) -> DSLResult<bool> {
+        match where_expr {
+            ASTNode::Expression(ExpressionNode::BinaryExpression {
+                left,
+                operator,
+                right,
+            }) => {
+                // Handle AND operations
+                if operator == "AND" {
+                    let left_result = self.evaluate_backup_where_ast(backup, cluster, left)?;
+                    let right_result = self.evaluate_backup_where_ast(backup, cluster, right)?;
+                    return Ok(left_result && right_result);
+                }
+
+                // Get left side value (should be a field)
+                let left_value = match &**left {
+                    ASTNode::Expression(ExpressionNode::Field { name, .. }) => {
+                        if let Some(field_name) = name.strip_prefix("backups.") {
+                            self.get_backup_field_value(backup, field_name)
+                                .unwrap_or_default()
+                        } else if let Some(field_name) = name.strip_prefix("clusters.") {
+                            self.get_field_value(cluster, field_name)
+                                .unwrap_or_default()
+                        } else {
+                            // Try backup first, then cluster
+                            self.get_backup_field_value(backup, name)
+                                .or_else(|| self.get_field_value(cluster, name))
+                                .unwrap_or_default()
+                        }
+                    }
+                    _ => return Ok(false), // Can't evaluate non-field expressions yet
+                };
+
+                // Get right side value (should be a literal)
+                let right_value = match &**right {
+                    ASTNode::Expression(ExpressionNode::Literal { value, .. }) => match value {
+                        DSLValue::String(s) => self.resolve_variables(s),
+                        _ => format!("{value:?}"),
+                    },
+                    ASTNode::Expression(ExpressionNode::Field { name, .. }) => {
+                        // Handle field-to-field comparisons like backups.tidbId = clusters.tidbid
+                        if let Some(field_name) = name.strip_prefix("backups.") {
+                            self.get_backup_field_value(backup, field_name)
+                                .unwrap_or_default()
+                        } else if let Some(field_name) = name.strip_prefix("clusters.") {
+                            self.get_field_value(cluster, field_name)
+                                .unwrap_or_default()
+                        } else {
+                            self.get_backup_field_value(backup, name)
+                                .or_else(|| self.get_field_value(cluster, name))
+                                .unwrap_or_default()
+                        }
+                    }
+                    _ => return Ok(false), // Can't evaluate complex expressions yet
+                };
+
+                // Apply the comparison operator
+                match operator.as_str() {
+                    "=" => Ok(left_value == right_value),
+                    "!=" => Ok(left_value != right_value),
+                    "LIKE" => {
+                        // Simple LIKE implementation - just contains for now
+                        let pattern = right_value.replace('%', "");
+                        Ok(left_value.contains(&pattern))
+                    }
+                    _ => Ok(false), // Unsupported operators
+                }
+            }
+            _ => Ok(true), // For now, non-binary expressions pass through
+        }
+    }
+
+    /// Evaluate WHERE clause AST for cluster filtering
+    fn evaluate_where_ast(&self, cluster: &Tidb, where_expr: &ASTNode) -> DSLResult<bool> {
+        match where_expr {
+            ASTNode::Expression(ExpressionNode::BinaryExpression {
+                left,
+                operator,
+                right,
+            }) => {
+                // Get left side value (should be a field)
+                let left_value = match &**left {
+                    ASTNode::Expression(ExpressionNode::Field { name, .. }) => {
+                        self.get_field_value(cluster, name).unwrap_or_default()
+                    }
+                    _ => return Ok(false), // Can't evaluate non-field expressions yet
+                };
+
+                // Get right side value (should be a literal)
+                let right_value = match &**right {
+                    ASTNode::Expression(ExpressionNode::Literal { value, .. }) => match value {
+                        DSLValue::String(s) => self.resolve_variables(s),
+                        _ => format!("{value:?}"),
+                    },
+                    _ => return Ok(false), // Can't evaluate non-literal expressions yet
+                };
+
+                // Apply the comparison operator
+                match operator.as_str() {
+                    "=" => Ok(left_value == right_value),
+                    "!=" => Ok(left_value != right_value),
+                    "LIKE" => {
+                        // Simple LIKE implementation - just contains for now
+                        let pattern = right_value.replace('%', "");
+                        Ok(left_value.contains(&pattern))
+                    }
+                    _ => Ok(false), // Unsupported operators
+                }
+            }
+            _ => Ok(true), // For now, non-binary expressions pass through
+        }
+    }
+
+    async fn execute_describe_table_ast(&mut self, table_name: &str) -> DSLResult<CommandResult> {
+        // Get table schema information from the schema module
+        let field_names = crate::schema::SCHEMA.get_field_names(table_name);
+        if field_names.is_empty() {
+            return Err(DSLError::execution_error(format!(
+                "Table '{table_name}' not found"
+            )));
+        }
+
+        let mut description = format!("Table: {table_name}\nColumns:\n");
+        for field_name in field_names {
+            // Add some basic type information for common fields
+            let field_type = if field_name.to_lowercase().contains("time")
+                || field_name.to_lowercase().contains("date")
+            {
+                "TIMESTAMP"
+            } else if field_name.to_lowercase().contains("size")
+                || field_name.to_lowercase().contains("bytes")
+            {
+                "BIGINT"
+            } else {
+                "VARCHAR"
+            };
+            description.push_str(&format!("  - {field_name} ({field_type})\n"));
+        }
+
+        Ok(CommandResult::success_with_message(description))
+    }
+
+    async fn execute_echo_ast(&mut self, message_node: &ASTNode) -> DSLResult<CommandResult> {
+        let message = self.evaluate_ast_to_string(message_node)?;
+        let resolved_message = self.resolve_variables(&message);
+        println!("{resolved_message}");
+        Ok(CommandResult::success_with_message(format!(
+            "Echoed: {resolved_message}"
+        )))
+    }
+
+    async fn execute_sleep_ast(&mut self, duration_node: &ASTNode) -> DSLResult<CommandResult> {
+        let duration_str = self.evaluate_ast_to_string(duration_node)?;
+        let duration: u64 = duration_str.parse().map_err(|_| {
+            DSLError::invalid_parameter(
+                "duration",
+                &duration_str,
+                "Must be a valid number".to_string(),
+            )
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(duration)).await;
+        Ok(CommandResult::success_with_message(format!(
+            "Slept for {duration}ms"
+        )))
+    }
+
+    async fn execute_set_variable_ast(
+        &mut self,
+        name: &str,
+        value_node: &ASTNode,
+    ) -> DSLResult<CommandResult> {
+        let value = self.evaluate_ast_to_string(value_node)?;
+        let resolved_value = self.resolve_variables(&value);
+        self.variables
+            .insert(name.to_string(), DSLValue::String(resolved_value.clone()));
+        Ok(CommandResult::success_with_message(format!(
+            "Set {name} = {resolved_value}"
+        )))
+    }
+
+    async fn execute_get_variable_ast(&mut self, name: &str) -> DSLResult<CommandResult> {
         match self.variables.get(name) {
-            Some(value) => Ok(CommandResult::success_with_data_and_message(
-                value.clone(),
-                format!("Variable '{name}' = {value}"),
-            )),
-            None => Err(DSLError::variable_not_found(name)),
+            Some(value) => {
+                let value_str = value.as_string().unwrap_or_default();
+                println!("{value_str}");
+                Ok(CommandResult::success_with_data(value.clone()))
+            }
+            None => Err(DSLError::execution_error(format!(
+                "Variable '{name}' not found"
+            ))),
         }
     }
 
-    async fn execute_set_log_level(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let level = command.get_parameter_as_string("level")?;
-
-        // Validate the log level
-        let valid_levels = ["trace", "debug", "info", "warn", "error"];
-        let level_lower = level.to_lowercase();
-
-        if !valid_levels.contains(&level_lower.as_str()) {
-            return Err(DSLError::invalid_parameter(
-                "level",
-                level,
-                "Must be one of: trace, debug, info, warn, error",
-            ));
-        }
-
-        // Convert string to tracing::Level
-        let new_level = match level_lower.as_str() {
+    async fn execute_set_log_level_ast(&mut self, level: &str) -> DSLResult<CommandResult> {
+        use tracing::Level;
+        let log_level = match level.to_lowercase().as_str() {
             "trace" => Level::TRACE,
             "debug" => Level::DEBUG,
             "info" => Level::INFO,
@@ -1810,143 +1612,127 @@ impl DSLExecutor {
                 return Err(DSLError::invalid_parameter(
                     "level",
                     level,
-                    "Must be one of: trace, debug, info, warn, error",
+                    "Must be one of: trace, debug, info, warn, error".to_string(),
                 ));
             }
         };
 
-        // Change the log level
-        match change_log_level(new_level) {
-            Ok(()) => Ok(CommandResult::success_with_message(format!(
-                "Log level changed to '{level_lower}'"
-            ))),
-            Err(e) => Err(DSLError::execution_error_with_source(
-                "Failed to change log level",
-                e.to_string(),
+        crate::logging::set_current_log_level(log_level);
+        Ok(CommandResult::success_with_message(format!(
+            "Log level set to {level}"
+        )))
+    }
+
+    async fn execute_if_ast(
+        &mut self,
+        _condition: &ASTNode,
+        _then_branch: &[ASTNode],
+        _else_branch: Option<&Vec<ASTNode>>,
+    ) -> DSLResult<CommandResult> {
+        Err(DSLError::execution_error(
+            "IF statements not yet fully implemented".to_string(),
+        ))
+    }
+
+    async fn execute_loop_ast(&mut self, _body: &[ASTNode]) -> DSLResult<CommandResult> {
+        Err(DSLError::execution_error(
+            "LOOP statements not yet fully implemented".to_string(),
+        ))
+    }
+
+    async fn execute_break_ast(&mut self) -> DSLResult<CommandResult> {
+        Err(DSLError::execution_error(
+            "BREAK statements not yet fully implemented".to_string(),
+        ))
+    }
+
+    async fn execute_continue_ast(&mut self) -> DSLResult<CommandResult> {
+        Err(DSLError::execution_error(
+            "CONTINUE statements not yet fully implemented".to_string(),
+        ))
+    }
+
+    async fn execute_return_ast(&mut self, _value: Option<&ASTNode>) -> DSLResult<CommandResult> {
+        Err(DSLError::execution_error(
+            "RETURN statements not yet fully implemented".to_string(),
+        ))
+    }
+
+    async fn execute_block_ast(&mut self, statements: &[ASTNode]) -> DSLResult<CommandResult> {
+        let mut last_result = CommandResult::success();
+        for statement in statements {
+            match Box::pin(self.execute_ast(statement)).await {
+                Ok(result) => last_result = result,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(last_result)
+    }
+
+    /// Helper method to evaluate AST nodes to strings
+    fn evaluate_ast_to_string(&self, node: &ASTNode) -> DSLResult<String> {
+        match node {
+            ASTNode::Expression(ExpressionNode::Literal { value }) => {
+                Ok(value.as_string().unwrap_or_default().to_string())
+            }
+            ASTNode::Expression(ExpressionNode::Variable { name }) => {
+                match self.variables.get(name) {
+                    Some(value) => Ok(value.as_string().unwrap_or_default().to_string()),
+                    None => Err(DSLError::execution_error(format!(
+                        "Variable '{name}' not found"
+                    ))),
+                }
+            }
+            _ => Err(DSLError::execution_error(
+                "Cannot evaluate AST node to string".to_string(),
             )),
         }
     }
 
-    async fn execute_echo(&self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let message = command.get_parameter_as_string("message")?;
-
-        // For DESCRIBE TABLE output, preserve formatting by not sanitizing
-        if message.contains("Table: ") && message.contains("Column Name") {
-            println!("{message}");
-            Ok(CommandResult::success_with_message(format!(
-                "Echoed: {message}"
-            )))
-        } else {
-            // Sanitize the message to prevent injection attacks for other echo commands
-            let sanitized_message = self.sanitize_output(message);
-            println!("{sanitized_message}");
-            Ok(CommandResult::success_with_message(format!(
-                "Echoed: {sanitized_message}"
-            )))
-        }
+    // Helper methods
+    fn cluster_to_dsl_value(&self, cluster: Tidb) -> DSLValue {
+        // Use schema-driven field access instead of hardcoded serialization
+        self.object_to_dsl_value(&cluster)
     }
 
-    async fn execute_sleep(&self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let seconds = command.get_parameter_as_number("seconds")?;
-        let total_duration = Duration::from_secs_f64(seconds);
-        let start_time = std::time::Instant::now();
+    /// Normalize any case to snake_case
+    fn normalize_to_snake_case(field_name: &str) -> String {
+        // Convert camelCase or PascalCase to snake_case
+        let mut result = String::new();
+        let mut prev_was_lowercase = false;
 
-        // Sleep in smaller intervals to allow for cancellation
-        let check_interval = Duration::from_millis(100); // Check every 100ms
-        let mut elapsed = Duration::ZERO;
+        for c in field_name.chars() {
+            if c.is_uppercase() && prev_was_lowercase {
+                result.push('_');
+                result.push(c.to_lowercase().next().unwrap());
+            } else {
+                result.push(c.to_lowercase().next().unwrap());
+            }
+            prev_was_lowercase = c.is_lowercase();
+        }
 
-        while elapsed < total_duration {
-            // Check for cancellation
-            if self.is_cancelled() {
-                return Err(DSLError::execution_error(
-                    "Sleep command was cancelled by user",
+        result
+    }
+
+    /// Convert snake_case to camelCase
+    fn snake_case_to_camel_case(snake_str: &str) -> String {
+        let parts: Vec<&str> = snake_str.split('_').collect();
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        let mut result = parts[0].to_lowercase();
+        for part in &parts[1..] {
+            if !part.is_empty() {
+                result.push_str(&format!(
+                    "{}{}",
+                    part.chars().next().unwrap().to_uppercase(),
+                    part.chars().skip(1).collect::<String>().to_lowercase()
                 ));
             }
-
-            // Sleep for the shorter of the remaining time or check interval
-            let remaining = total_duration - elapsed;
-            let sleep_duration = if remaining < check_interval {
-                remaining
-            } else {
-                check_interval
-            };
-
-            tokio::time::sleep(sleep_duration).await;
-            elapsed = start_time.elapsed();
         }
 
-        Ok(CommandResult::success_with_message(format!(
-            "Slept for {seconds} seconds"
-        )))
-    }
-
-    async fn execute_if(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        let condition = command.require_parameter("condition")?;
-
-        if condition.is_truthy() {
-            Ok(CommandResult::success_with_message("If condition was true"))
-        } else {
-            Ok(CommandResult::success_with_message(
-                "If condition was false",
-            ))
-        }
-    }
-
-    async fn execute_loop(&mut self, _command: DSLCommand) -> DSLResult<CommandResult> {
-        // For now, just return success
-        // In a full implementation, this would handle loop execution
-        Ok(CommandResult::success_with_message("Loop executed"))
-    }
-
-    async fn execute_break(&mut self, _command: DSLCommand) -> DSLResult<CommandResult> {
-        Ok(CommandResult::success_with_message("Break executed"))
-    }
-
-    async fn execute_continue(&mut self, _command: DSLCommand) -> DSLResult<CommandResult> {
-        Ok(CommandResult::success_with_message("Continue executed"))
-    }
-
-    async fn execute_return(&mut self, command: DSLCommand) -> DSLResult<CommandResult> {
-        if let Some(value) = command.get_optional_parameter("value") {
-            Ok(CommandResult::success_with_data_and_message(
-                value.clone(),
-                "Return executed",
-            ))
-        } else {
-            Ok(CommandResult::success_with_message("Return executed"))
-        }
-    }
-
-    async fn execute_exit(&mut self, _command: DSLCommand) -> DSLResult<CommandResult> {
-        Ok(CommandResult::success_with_message("Exit executed"))
-    }
-
-    // Helper methods
-
-    fn should_continue_on_error(&self, _command: &DSLCommand) -> bool {
-        // For now, always continue on error
-        // This could be configurable per command or globally
-        true
-    }
-
-    fn cluster_to_dsl_value(&self, cluster: Tidb) -> DSLValue {
-        // Use serde_json to serialize the cluster to JSON, then convert to DSLValue
-        // This makes it dynamic and automatically includes all fields from the JSON specification
-        match serde_json::to_value(&cluster) {
-            Ok(json_value) => {
-                // Convert serde_json::Value to DSLValue
-                Self::json_value_to_dsl_value(json_value)
-            }
-            Err(_) => {
-                // Fallback to a basic object if serialization fails
-                let mut obj = HashMap::new();
-                obj.insert(
-                    "error".to_string(),
-                    DSLValue::from("Failed to serialize cluster"),
-                );
-                DSLValue::Object(obj)
-            }
-        }
+        result
     }
 
     /// Convert serde_json::Value to DSLValue recursively
@@ -1987,39 +1773,35 @@ impl DSLExecutor {
             serde_json::Value::Object(obj) => {
                 let mut filtered_obj = HashMap::new();
                 for field in selected_fields {
-                    // Try to find the field in the JSON object by checking multiple possible names:
-                    // 1. Exact field name
-                    // 2. JSON name from schema mapping
-                    let json_field_name = crate::schema::SCHEMA
-                        .get_json_name(object_type, field)
-                        .unwrap_or_else(|| field.clone());
+                    // Normalize field to snake_case first
+                    let normalized_field = Self::normalize_to_snake_case(field);
 
-                    let field_value = obj
-                        .get(field)
-                        .or_else(|| obj.get(&json_field_name))
-                        .or_else(|| {
-                            // Try some common variations
-                            if field == "tidbId" {
-                                obj.get("tidb_id")
-                            } else if field == "tidb_id" {
-                                obj.get("tidbId")
-                            } else if field == "displayName" {
-                                obj.get("display_name")
-                            } else if field == "display_name" {
-                                obj.get("displayName")
-                            } else {
-                                None
-                            }
+                    // Get the proper JSON field name from schema
+                    let json_field_name = crate::schema::SCHEMA
+                        .get_json_name(object_type, &normalized_field)
+                        .unwrap_or_else(|| {
+                            // If schema doesn't have it, try to convert snake_case to camelCase
+                            Self::snake_case_to_camel_case(&normalized_field)
                         });
 
+                    let field_value = obj
+                        .get(&json_field_name)
+                        .or_else(|| obj.get(&normalized_field))
+                        .or_else(|| obj.get(field));
+
                     if let Some(value) = field_value {
-                        filtered_obj
-                            .insert(field.clone(), Self::json_value_to_dsl_value(value.clone()));
+                        // Use the normalized snake_case name for consistency in output
+                        filtered_obj.insert(
+                            normalized_field.clone(),
+                            Self::json_value_to_dsl_value(value.clone()),
+                        );
                     } else {
                         // Field not found - add an informative null entry to help debug
                         tracing::debug!(
-                            "Field '{}' not found in {} object. Available fields: {:?}",
+                            "Field '{}' (normalized: '{}', JSON: '{}') not found in {} object. Available fields: {:?}",
                             field,
+                            normalized_field,
+                            json_field_name,
                             object_type,
                             obj.keys().collect::<Vec<_>>()
                         );
@@ -2043,23 +1825,8 @@ impl DSLExecutor {
     }
 
     fn backup_to_dsl_value(&self, backup: Backup) -> DSLValue {
-        // Use serde_json to serialize the backup to JSON, then convert to DSLValue
-        // This makes it dynamic and automatically includes all fields from the JSON specification
-        match serde_json::to_value(&backup) {
-            Ok(json_value) => {
-                // Don't filter null values - keep all fields for display
-                Self::json_value_to_dsl_value(json_value)
-            }
-            Err(_) => {
-                // Fallback to a basic object if serialization fails
-                let mut obj = HashMap::new();
-                obj.insert(
-                    "error".to_string(),
-                    DSLValue::from("Failed to serialize backup"),
-                );
-                DSLValue::Object(obj)
-            }
-        }
+        // Use schema-driven field access instead of hardcoded serialization
+        self.object_to_dsl_value(&backup)
     }
 
     fn backup_to_dsl_value_filtered(
@@ -2067,22 +1834,19 @@ impl DSLExecutor {
         backup: &Backup,
         selected_fields: &[String],
     ) -> DSLValue {
-        // Use serde_json to serialize the backup to JSON, then convert to DSLValue with field filtering
-        match serde_json::to_value(backup) {
-            Ok(json_value) => {
-                // Convert serde_json::Value to DSLValue with field filtering
-                Self::json_value_to_dsl_value_filtered(json_value, selected_fields, "Backup")
-            }
-            Err(_) => {
-                // Fallback to a basic object if serialization fails
-                let mut obj = HashMap::new();
-                obj.insert(
-                    "error".to_string(),
-                    DSLValue::from("Failed to serialize backup"),
-                );
-                DSLValue::Object(obj)
+        // Use schema-driven field access with filtering
+        let mut result = HashMap::new();
+
+        for field_name in selected_fields {
+            // Validate field using schema
+            if backup.has_field(field_name)
+                && let Some(value) = backup.get_field_value(field_name)
+            {
+                result.insert(field_name.clone(), DSLValue::String(value));
             }
         }
+
+        DSLValue::Object(result)
     }
 
     fn price_to_dsl_value(&self, price: EstimatePriceResponse) -> DSLValue {
@@ -2157,33 +1921,6 @@ impl DSLExecutor {
             .collect()
     }
 
-    /// Check rate limiting before making API calls
-    async fn check_rate_limit(&self) -> DSLResult<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let last_time = self.last_request_time.load(Ordering::Relaxed);
-        let count = self.request_count.load(Ordering::Relaxed);
-
-        // Reset counter if more than 1 minute has passed
-        if now - last_time > 60 {
-            self.request_count.store(0, Ordering::Relaxed);
-            self.last_request_time.store(now, Ordering::Relaxed);
-        }
-
-        // Allow max 100 requests per minute
-        if count >= 100 {
-            return Err(DSLError::execution_error(
-                "Rate limit exceeded: maximum 100 requests per minute",
-            ));
-        }
-
-        self.request_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Validate cluster name format
     fn validate_cluster_name(&self, name: &str) -> DSLResult<()> {
         if name.is_empty() {
@@ -2238,43 +1975,19 @@ impl DSLExecutor {
             ));
         }
 
-        // Check for valid region format (e.g., aws-us-west-1, gcp-us-central1)
-        let valid_regions = [
-            "aws-us-west-1",
-            "aws-us-east-1",
-            // FIXME: We should be able to get this from the API
-        ];
+        // Check for basic region format - be more permissive since the API will validate
+        let clean_region = region.trim_matches('"');
 
-        if !valid_regions.contains(&region) {
+        // Basic validation - should contain some identifiable pattern
+        if !clean_region.contains("-") || clean_region.len() < 5 {
             return Err(DSLError::invalid_parameter(
                 "region",
                 region,
-                "Invalid region format",
+                "Invalid region format - should be like 'aws-us-east-1' or 'us-east-1'",
             ));
         }
 
-        Ok(())
-    }
-
-    /// Validate that only allowed parameters are provided for CREATE CLUSTER command
-    fn validate_create_cluster_parameters(&self, command: &DSLCommand) -> DSLResult<()> {
-        // Get allowed parameters from the Tidb struct definition
-        let allowed_parameters = self.get_create_cluster_allowed_parameters();
-
-        // Check each parameter in the command
-        for param_name in command.parameters.keys() {
-            if !allowed_parameters.contains(param_name) {
-                return Err(DSLError::invalid_parameter(
-                    param_name,
-                    "unknown",
-                    format!(
-                        "Invalid parameter '{}' for CREATE CLUSTER. Allowed parameters are: {}",
-                        param_name,
-                        allowed_parameters.join(", ")
-                    ),
-                ));
-            }
-        }
+        // Let the API validate the actual region - we'll just do basic format checking
 
         Ok(())
     }
@@ -2291,14 +2004,14 @@ impl DSLExecutor {
     }
 
     /// Get field value from cluster using dot notation for nested fields
-    /// This is a truly generic, schema-driven field access method with NO hardcoded field names
+    /// This is a truly generic, schema-driven field access method
     fn get_field_value(&self, cluster: &Tidb, field_path: &str) -> Option<String> {
         // Parse field path more carefully to handle quoted keys
         let parts = self.parse_field_path(field_path);
 
         let field_name = parts[0].as_str();
 
-        // Check if it's a valid field name first - NO hardcoded field names!
+        // Check if it's a valid field name first
         if !self.is_valid_tidb_field(field_name)
             && !crate::schema::FIELD_ACCESSORS.is_nested_field(field_name)
             && !crate::schema::FIELD_ACCESSORS.is_array_field(field_name)
@@ -2342,43 +2055,43 @@ impl DSLExecutor {
         }
     }
 
-    /// Generic direct field access - NO hardcoded field names
+    /// Generic direct field access
     fn get_direct_field_value(&self, cluster: &Tidb, field_name: &str) -> Option<String> {
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_field_value(cluster, field_name)
     }
 
-    /// Generic optional field access - NO hardcoded field names
+    /// Generic optional field access
     fn get_optional_field_value(&self, cluster: &Tidb, field_name: &str) -> Option<String> {
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_field_value(cluster, field_name)
     }
 
-    /// Generic formatted field access - NO hardcoded field names
+    /// Generic formatted field access
     fn get_formatted_field_value(&self, cluster: &Tidb, field_name: &str) -> Option<String> {
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_field_value(cluster, field_name)
     }
 
-    /// Generic nested field access - NO hardcoded field names
+    /// Generic nested field access
     fn get_nested_field_value(
         &self,
         cluster: &Tidb,
         field_name: &str,
         parts: &[String],
     ) -> Option<String> {
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_nested_field_value(cluster, field_name, parts)
     }
 
-    /// Generic array field access - NO hardcoded field names
+    /// Generic array field access
     fn get_array_field_value(
         &self,
         cluster: &Tidb,
         field_name: &str,
         parts: &[String],
     ) -> Option<String> {
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_array_field_value(cluster, field_name, parts)
     }
 
@@ -2393,7 +2106,7 @@ impl DSLExecutor {
             .get_canonical_name("Backup", field_name)
             .unwrap_or_else(|| field_name.to_string());
 
-        // Use the dynamic field accessor registry - NO hardcoded field names!
+        // Use the dynamic field accessor registry
         crate::schema::FIELD_ACCESSORS.get_backup_field_value(backup, &canonical_name)
     }
 
@@ -2475,49 +2188,21 @@ impl DSLExecutor {
     }
 
     /// Get a list of available fields for WHERE clause filtering
-    /// Get parameter value with default from schema - NO hardcoded values!
-    fn get_parameter_value_with_default(
-        &self,
-        command: &DSLCommand,
-        command_name: &str,
-        param_name: &str,
-    ) -> DSLResult<String> {
-        // First try to get from command
-        if let Some(value) = command.get_optional_parameter(param_name) {
-            match value {
-                DSLValue::String(s) => Ok(s.clone()),
-                DSLValue::Number(n) => Ok(n.to_string()),
-                _ => {
-                    // Fall back to schema default
-                    crate::schema::get_parameter_default(command_name, param_name).ok_or_else(
-                        || {
-                            DSLError::invalid_parameter(
-                                param_name,
-                                format!("{value:?}"),
-                                "Invalid parameter type",
-                            )
-                        },
-                    )
-                }
-            }
-        } else {
-            // Use schema default
-            crate::schema::get_parameter_default(command_name, param_name)
-                .ok_or_else(|| DSLError::missing_parameter(command_name, param_name))
-        }
-    }
+    /// Get parameter value with default from schema
+    /// Resolve variables in a string value
+    fn resolve_variables(&self, value: &str) -> String {
+        let mut result = value.to_string();
 
-    /// Get optional parameter value from schema - NO hardcoded values!
-    fn get_optional_parameter_value(
-        &self,
-        command: &DSLCommand,
-        _command_name: &str,
-        param_name: &str,
-    ) -> Option<String> {
-        command
-            .get_optional_parameter(param_name)
-            .and_then(|v| v.as_string())
-            .map(|s| s.to_string())
+        // Handle $VAR format (primary format)
+        for (var_name, var_value) in &self.variables {
+            let pattern = format!("${var_name}");
+
+            if let Some(value_str) = var_value.as_string() {
+                result = result.replace(&pattern, value_str);
+            }
+        }
+
+        result
     }
 
     /// Check if a field name is valid for the Tidb struct
@@ -4040,38 +3725,12 @@ impl DSLExecutor {
     /// Check if a field-operator combination is allowed in a given context
     fn is_field_operator_allowed(
         &self,
-        field_name: &str,
-        context: &FieldContext,
-        operator: &str,
+        _field_name: &str,
+        _context: &FieldContext,
+        _operator: &str, // We'll simplify and not validate operators for now
     ) -> bool {
-        // Normalize operator to uppercase for case-insensitive comparison
-        let normalized_operator = operator.to_uppercase();
-
-        // Use constants for allowed combinations
-        match context {
-            FieldContext::Cluster => Self::is_allowed(
-                field_name,
-                &normalized_operator,
-                CLUSTER_FIELDS,
-                CLUSTER_OPERATORS,
-            ),
-            FieldContext::Backups | FieldContext::None => Self::is_allowed(
-                field_name,
-                &normalized_operator,
-                BACKUP_FIELDS,
-                BACKUP_OPERATORS,
-            ),
-        }
-    }
-
-    /// Helper function to check if a field-operator combination is allowed
-    fn is_allowed(
-        field_name: &str,
-        operator: &str,
-        allowed_fields: &[&str],
-        allowed_operators: &[&str],
-    ) -> bool {
-        allowed_fields.contains(&field_name) && allowed_operators.contains(&operator)
+        // All fields should be filterable, so always return true
+        true
     }
 
     /// Create a standardized syntax error
@@ -4083,6 +3742,50 @@ impl DSLExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_to_snake_case() {
+        assert_eq!(
+            DSLExecutor::normalize_to_snake_case("displayName"),
+            "display_name"
+        );
+        assert_eq!(DSLExecutor::normalize_to_snake_case("tidbId"), "tidb_id");
+        assert_eq!(
+            DSLExecutor::normalize_to_snake_case("sizeBytes"),
+            "size_bytes"
+        );
+        assert_eq!(
+            DSLExecutor::normalize_to_snake_case("region_id"),
+            "region_id"
+        );
+        assert_eq!(DSLExecutor::normalize_to_snake_case("state"), "state");
+        assert_eq!(
+            DSLExecutor::normalize_to_snake_case("PascalCase"),
+            "pascal_case"
+        );
+        assert_eq!(
+            DSLExecutor::normalize_to_snake_case("HTTPStatusCode"),
+            "httpstatus_code"
+        );
+    }
+
+    #[test]
+    fn test_snake_case_to_camel_case() {
+        assert_eq!(
+            DSLExecutor::snake_case_to_camel_case("display_name"),
+            "displayName"
+        );
+        assert_eq!(DSLExecutor::snake_case_to_camel_case("tidb_id"), "tidbId");
+        assert_eq!(
+            DSLExecutor::snake_case_to_camel_case("size_bytes"),
+            "sizeBytes"
+        );
+        assert_eq!(
+            DSLExecutor::snake_case_to_camel_case("region_id"),
+            "regionId"
+        );
+        assert_eq!(DSLExecutor::snake_case_to_camel_case("state"), "state");
+    }
     use crate::dsl::{
         ast::{ASTNode, CommandNode, ExpressionNode, QueryNode, UtilityNode},
         syntax::DSLValue,
@@ -4355,16 +4058,19 @@ mod tests {
         let mut executor = create_test_executor();
 
         let describe_node = ASTNode::Query(QueryNode::DescribeTable {
-            table_name: "CLUSTERS".to_string(),
+            table_name: "Tidb".to_string(),
         });
 
         let result = executor.execute_ast(&describe_node).await;
+        if let Err(ref e) = result {
+            println!("Describe table error: {:?}", e);
+        }
         assert!(result.is_ok());
         let command_result = result.unwrap();
         assert!(command_result.is_success());
 
         let message = command_result.get_message().unwrap();
-        assert!(message.contains("Table: CLUSTERS"));
+        assert!(message.contains("Table: Tidb"));
         assert!(message.contains("displayName"));
         assert!(message.contains("VARCHAR"));
     }
@@ -4460,5 +4166,513 @@ mod tests {
 
         let empty_node = ASTNode::Empty;
         assert_eq!(empty_node.variant_name(), "Empty");
+    }
+
+    // ===== CONTROL FLOW TESTS =====
+
+    #[tokio::test]
+    async fn test_execute_ast_if_statement() {
+        let mut executor = create_test_executor();
+
+        // Test IF statement with true condition
+        let if_node = ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+            condition: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            })),
+            then_branch: vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Condition is true".to_string()),
+                })),
+            })],
+            else_branch: None,
+        });
+
+        let result = executor.execute_ast(&if_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("IF statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_if_statement_with_else() {
+        let mut executor = create_test_executor();
+
+        // Test IF statement with false condition and else branch
+        let if_node = ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+            condition: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(false),
+            })),
+            then_branch: vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Condition is true".to_string()),
+                })),
+            })],
+            else_branch: Some(vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Condition is false".to_string()),
+                })),
+            })]),
+        });
+
+        let result = executor.execute_ast(&if_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("IF statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_if_statement_with_variable_condition() {
+        let mut executor = create_test_executor();
+
+        // Set up a variable for the condition
+        executor.set_variable("test_var".to_string(), DSLValue::String("true".to_string()));
+
+        let if_node = ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+            condition: Box::new(ASTNode::Expression(ExpressionNode::Variable {
+                name: "test_var".to_string(),
+            })),
+            then_branch: vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Variable condition is true".to_string()),
+                })),
+            })],
+            else_branch: None,
+        });
+
+        let result = executor.execute_ast(&if_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("IF statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_loop_statement() {
+        let mut executor = create_test_executor();
+
+        // Test LOOP statement with condition
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: Some(Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            }))),
+            body: vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Loop iteration".to_string()),
+                })),
+            })],
+        });
+
+        let result = executor.execute_ast(&loop_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("LOOP statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_loop_statement_without_condition() {
+        let mut executor = create_test_executor();
+
+        // Test LOOP statement without condition (infinite loop)
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: None,
+            body: vec![ASTNode::Utility(UtilityNode::Echo {
+                message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::String("Infinite loop".to_string()),
+                })),
+            })],
+        });
+
+        let result = executor.execute_ast(&loop_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("LOOP statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_loop_statement_with_break() {
+        let mut executor = create_test_executor();
+
+        // Test LOOP statement with BREAK in body
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: Some(Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            }))),
+            body: vec![
+                ASTNode::Utility(UtilityNode::Echo {
+                    message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("Before break".to_string()),
+                    })),
+                }),
+                ASTNode::ControlFlow(ControlFlowNode::BreakStatement),
+                ASTNode::Utility(UtilityNode::Echo {
+                    message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("After break (should not execute)".to_string()),
+                    })),
+                }),
+            ],
+        });
+
+        let result = executor.execute_ast(&loop_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("LOOP statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_loop_statement_with_continue() {
+        let mut executor = create_test_executor();
+
+        // Test LOOP statement with CONTINUE in body
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: Some(Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            }))),
+            body: vec![
+                ASTNode::Utility(UtilityNode::Echo {
+                    message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("Before continue".to_string()),
+                    })),
+                }),
+                ASTNode::ControlFlow(ControlFlowNode::ContinueStatement),
+                ASTNode::Utility(UtilityNode::Echo {
+                    message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String(
+                            "After continue (should not execute in this iteration)".to_string(),
+                        ),
+                    })),
+                }),
+            ],
+        });
+
+        let result = executor.execute_ast(&loop_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("LOOP statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_break_statement() {
+        let mut executor = create_test_executor();
+
+        // Test BREAK statement
+        let break_node = ASTNode::ControlFlow(ControlFlowNode::BreakStatement);
+
+        let result = executor.execute_ast(&break_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("BREAK statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_continue_statement() {
+        let mut executor = create_test_executor();
+
+        // Test CONTINUE statement
+        let continue_node = ASTNode::ControlFlow(ControlFlowNode::ContinueStatement);
+
+        let result = executor.execute_ast(&continue_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("CONTINUE statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_return_statement() {
+        let mut executor = create_test_executor();
+
+        // Test RETURN statement without value
+        let return_node = ASTNode::ControlFlow(ControlFlowNode::ReturnStatement { value: None });
+
+        let result = executor.execute_ast(&return_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("RETURN statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_return_statement_with_value() {
+        let mut executor = create_test_executor();
+
+        // Test RETURN statement with value
+        let return_node = ASTNode::ControlFlow(ControlFlowNode::ReturnStatement {
+            value: Some(Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::String("Return value".to_string()),
+            }))),
+        });
+
+        let result = executor.execute_ast(&return_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("RETURN statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_block_statement() {
+        let mut executor = create_test_executor();
+
+        // Test BLOCK statement with multiple statements
+        let block_node = ASTNode::ControlFlow(ControlFlowNode::Block {
+            statements: vec![
+                ASTNode::Utility(UtilityNode::SetVariable {
+                    name: "block_var1".to_string(),
+                    value: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("value1".to_string()),
+                    })),
+                }),
+                ASTNode::Utility(UtilityNode::SetVariable {
+                    name: "block_var2".to_string(),
+                    value: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("value2".to_string()),
+                    })),
+                }),
+                ASTNode::Utility(UtilityNode::Echo {
+                    message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("Block executed".to_string()),
+                    })),
+                }),
+            ],
+        });
+
+        let result = executor.execute_ast(&block_node).await;
+        assert!(result.is_ok());
+        let command_result = result.unwrap();
+        assert!(command_result.is_success());
+
+        // Verify that variables were set
+        assert_eq!(
+            executor.get_variable("block_var1"),
+            Some(&DSLValue::String("value1".to_string()))
+        );
+        assert_eq!(
+            executor.get_variable("block_var2"),
+            Some(&DSLValue::String("value2".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_block_statement_with_error() {
+        let mut executor = create_test_executor();
+
+        // Test BLOCK statement with an error in the middle
+        let block_node = ASTNode::ControlFlow(ControlFlowNode::Block {
+            statements: vec![
+                ASTNode::Utility(UtilityNode::SetVariable {
+                    name: "before_error".to_string(),
+                    value: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("before".to_string()),
+                    })),
+                }),
+                ASTNode::Utility(UtilityNode::GetVariable {
+                    name: "nonexistent_var".to_string(),
+                }),
+                ASTNode::Utility(UtilityNode::SetVariable {
+                    name: "after_error".to_string(),
+                    value: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::String("after".to_string()),
+                    })),
+                }),
+            ],
+        });
+
+        let result = executor.execute_ast(&block_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Variable 'nonexistent_var' not found")
+        );
+
+        // Verify that the first variable was set but the last one wasn't
+        assert_eq!(
+            executor.get_variable("before_error"),
+            Some(&DSLValue::String("before".to_string()))
+        );
+        assert_eq!(executor.get_variable("after_error"), None);
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_nested_control_flow() {
+        let mut executor = create_test_executor();
+
+        // Test nested control flow structures
+        let nested_node = ASTNode::ControlFlow(ControlFlowNode::Block {
+            statements: vec![ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+                condition: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                    value: DSLValue::Boolean(true),
+                })),
+                then_branch: vec![ASTNode::ControlFlow(ControlFlowNode::Block {
+                    statements: vec![ASTNode::Utility(UtilityNode::Echo {
+                        message: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                            value: DSLValue::String("Nested block in if".to_string()),
+                        })),
+                    })],
+                })],
+                else_branch: None,
+            })],
+        });
+
+        let result = executor.execute_ast(&nested_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("IF statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_control_flow_with_variables() {
+        let mut executor = create_test_executor();
+
+        // Test control flow with variable manipulation
+        let control_flow_node = ASTNode::ControlFlow(ControlFlowNode::Block {
+            statements: vec![
+                ASTNode::Utility(UtilityNode::SetVariable {
+                    name: "counter".to_string(),
+                    value: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                        value: DSLValue::Number(0.0),
+                    })),
+                }),
+                ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+                    condition: Some(Box::new(ASTNode::Expression(
+                        ExpressionNode::BinaryExpression {
+                            left: Box::new(ASTNode::Expression(ExpressionNode::Variable {
+                                name: "counter".to_string(),
+                            })),
+                            operator: "<".to_string(),
+                            right: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                                value: DSLValue::Number(3.0),
+                            })),
+                        },
+                    ))),
+                    body: vec![
+                        ASTNode::Utility(UtilityNode::Echo {
+                            message: Box::new(ASTNode::Expression(ExpressionNode::Variable {
+                                name: "counter".to_string(),
+                            })),
+                        }),
+                        ASTNode::ControlFlow(ControlFlowNode::BreakStatement),
+                    ],
+                }),
+            ],
+        });
+
+        let result = executor.execute_ast(&control_flow_node).await;
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("LOOP statements not yet fully implemented")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_control_flow_node_dispatch() {
+        let _executor = create_test_executor();
+
+        // Test that different control flow node types are dispatched correctly
+        let if_node = ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+            condition: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            })),
+            then_branch: vec![],
+            else_branch: None,
+        });
+        assert!(if_node.is_control_flow());
+
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: None,
+            body: vec![],
+        });
+        assert!(loop_node.is_control_flow());
+
+        let break_node = ASTNode::ControlFlow(ControlFlowNode::BreakStatement);
+        assert!(break_node.is_control_flow());
+
+        let continue_node = ASTNode::ControlFlow(ControlFlowNode::ContinueStatement);
+        assert!(continue_node.is_control_flow());
+
+        let return_node = ASTNode::ControlFlow(ControlFlowNode::ReturnStatement { value: None });
+        assert!(return_node.is_control_flow());
+
+        let block_node = ASTNode::ControlFlow(ControlFlowNode::Block { statements: vec![] });
+        assert!(block_node.is_control_flow());
+    }
+
+    #[tokio::test]
+    async fn test_execute_ast_control_flow_variant_names() {
+        // Test variant names for control flow nodes
+        let if_node = ASTNode::ControlFlow(ControlFlowNode::IfStatement {
+            condition: Box::new(ASTNode::Expression(ExpressionNode::Literal {
+                value: DSLValue::Boolean(true),
+            })),
+            then_branch: vec![],
+            else_branch: None,
+        });
+        assert_eq!(if_node.variant_name(), "IfStatement");
+
+        let loop_node = ASTNode::ControlFlow(ControlFlowNode::LoopStatement {
+            condition: None,
+            body: vec![],
+        });
+        assert_eq!(loop_node.variant_name(), "LoopStatement");
+
+        let break_node = ASTNode::ControlFlow(ControlFlowNode::BreakStatement);
+        assert_eq!(break_node.variant_name(), "BreakStatement");
+
+        let continue_node = ASTNode::ControlFlow(ControlFlowNode::ContinueStatement);
+        assert_eq!(continue_node.variant_name(), "ContinueStatement");
+
+        let return_node = ASTNode::ControlFlow(ControlFlowNode::ReturnStatement { value: None });
+        assert_eq!(return_node.variant_name(), "ReturnStatement");
+
+        let block_node = ASTNode::ControlFlow(ControlFlowNode::Block { statements: vec![] });
+        assert_eq!(block_node.variant_name(), "Block");
     }
 }

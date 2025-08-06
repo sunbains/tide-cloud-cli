@@ -340,37 +340,40 @@ impl DSLASTParser {
 
     /// Parse SET command
     fn parse_set_command(&mut self, input: &str) -> DSLResult<ASTNode> {
-        let parts: Vec<&str> = input.split_whitespace().collect();
+        let input = input.trim();
 
-        if parts.len() < 3 {
-            return Err(DSLError::syntax_error(
-                0,
-                "SET requires: variable = value".to_string(),
-            ));
-        }
-
-        if parts[0].to_uppercase() != "SET" {
+        if !input.to_uppercase().starts_with("SET ") {
             return Err(DSLError::syntax_error(0, "Expected SET".to_string()));
         }
 
-        let name = parts[1].to_string();
+        let after_set = &input[4..].trim(); // Remove "SET " prefix
 
-        if parts[2] != "=" {
-            return Err(DSLError::syntax_error(
+        // Find the equals sign
+        if let Some(equal_pos) = after_set.find('=') {
+            let name = after_set[..equal_pos].trim().to_string();
+            let value_str = after_set[equal_pos + 1..].trim();
+
+            if name.is_empty() {
+                return Err(DSLError::syntax_error(
+                    0,
+                    "SET requires: variable = value".to_string(),
+                ));
+            }
+
+            let value = self.parse_value(value_str)?;
+
+            Ok(ASTNode::Utility(
+                crate::dsl::ast::UtilityNode::SetVariable {
+                    name,
+                    value: Box::new(value),
+                },
+            ))
+        } else {
+            Err(DSLError::syntax_error(
                 0,
-                "Expected = after variable name".to_string(),
-            ));
+                "SET requires: variable = value".to_string(),
+            ))
         }
-
-        let value_str = parts[3..].join(" ");
-        let value = self.parse_value(&value_str)?;
-
-        Ok(ASTNode::Utility(
-            crate::dsl::ast::UtilityNode::SetVariable {
-                name,
-                value: Box::new(value),
-            },
-        ))
     }
 
     /// Parse ECHO command
@@ -461,7 +464,9 @@ impl DSLASTParser {
     fn parse_set_clause(&mut self, set_clause: &str) -> DSLResult<Vec<ASTNode>> {
         let mut updates = Vec::new();
 
-        let parts: Vec<&str> = set_clause.split(',').collect();
+        // Smart split on commas, taking into account nested braces and brackets
+        let parts = self.smart_split_on_comma(set_clause);
+
         for part in parts {
             let part = part.trim();
             if let Some(equal_pos) = part.find('=') {
@@ -488,6 +493,73 @@ impl DSLASTParser {
         }
 
         Ok(updates)
+    }
+
+    /// Smart split on commas, respecting nested braces and brackets
+    fn smart_split_on_comma(&self, input: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current_part = String::new();
+        let mut brace_depth = 0;
+        let mut bracket_depth = 0;
+        let mut in_quotes = false;
+        let mut quote_char = '\0';
+
+        for ch in input.chars() {
+            match ch {
+                '"' | '\'' => {
+                    if !in_quotes {
+                        in_quotes = true;
+                        quote_char = ch;
+                    } else if ch == quote_char {
+                        in_quotes = false;
+                    }
+                    current_part.push(ch);
+                }
+                '{' => {
+                    if !in_quotes {
+                        brace_depth += 1;
+                    }
+                    current_part.push(ch);
+                }
+                '}' => {
+                    if !in_quotes {
+                        brace_depth -= 1;
+                    }
+                    current_part.push(ch);
+                }
+                '[' => {
+                    if !in_quotes {
+                        bracket_depth += 1;
+                    }
+                    current_part.push(ch);
+                }
+                ']' => {
+                    if !in_quotes {
+                        bracket_depth -= 1;
+                    }
+                    current_part.push(ch);
+                }
+                ',' => {
+                    if !in_quotes && brace_depth == 0 && bracket_depth == 0 {
+                        // This is a top-level comma, split here
+                        parts.push(current_part.trim().to_string());
+                        current_part.clear();
+                    } else {
+                        current_part.push(ch);
+                    }
+                }
+                _ => {
+                    current_part.push(ch);
+                }
+            }
+        }
+
+        // Add the last part
+        if !current_part.trim().is_empty() {
+            parts.push(current_part.trim().to_string());
+        }
+
+        parts
     }
 
     /// Parse WHERE clause
@@ -561,8 +633,10 @@ impl DSLASTParser {
     fn parse_value(&mut self, value_str: &str) -> DSLResult<ASTNode> {
         let value_str = value_str.trim();
 
-        // String literal
-        if value_str.starts_with('\'') && value_str.ends_with('\'') {
+        // String literal (handle both single and double quotes)
+        if (value_str.starts_with('\'') && value_str.ends_with('\''))
+            || (value_str.starts_with('"') && value_str.ends_with('"'))
+        {
             let content = &value_str[1..value_str.len() - 1];
             return Ok(ASTNode::Expression(
                 crate::dsl::ast::ExpressionNode::Literal {
@@ -578,6 +652,25 @@ impl DSLASTParser {
                     value: DSLValue::Number(number),
                 },
             ));
+        }
+
+        // JSON object literal
+        if value_str.starts_with('{') && value_str.ends_with('}') {
+            // Parse JSON object
+            match serde_json::from_str(value_str) {
+                Ok(json_value) => {
+                    let dsl_value = Self::json_to_dsl_value(json_value)?;
+                    return Ok(ASTNode::Expression(
+                        crate::dsl::ast::ExpressionNode::Literal { value: dsl_value },
+                    ));
+                }
+                Err(_) => {
+                    return Err(DSLError::syntax_error(
+                        0,
+                        format!("Invalid JSON object: {value_str}"),
+                    ));
+                }
+            }
         }
 
         // Boolean literal
@@ -599,6 +692,36 @@ impl DSLASTParser {
                         name: value_str.to_string(),
                     },
                 ))
+            }
+        }
+    }
+
+    /// Convert serde_json::Value to DSLValue
+    fn json_to_dsl_value(json_value: serde_json::Value) -> DSLResult<DSLValue> {
+        match json_value {
+            serde_json::Value::Null => Ok(DSLValue::Null),
+            serde_json::Value::Bool(b) => Ok(DSLValue::Boolean(b)),
+            serde_json::Value::Number(n) => {
+                if let Some(f) = n.as_f64() {
+                    Ok(DSLValue::Number(f))
+                } else {
+                    Ok(DSLValue::Number(0.0))
+                }
+            }
+            serde_json::Value::String(s) => Ok(DSLValue::String(s)),
+            serde_json::Value::Array(arr) => {
+                let mut dsl_array = Vec::new();
+                for item in arr {
+                    dsl_array.push(Self::json_to_dsl_value(item)?);
+                }
+                Ok(DSLValue::Array(dsl_array))
+            }
+            serde_json::Value::Object(obj) => {
+                let mut dsl_object = std::collections::HashMap::new();
+                for (key, value) in obj {
+                    dsl_object.insert(key, Self::json_to_dsl_value(value)?);
+                }
+                Ok(DSLValue::Object(dsl_object))
             }
         }
     }

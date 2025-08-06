@@ -119,6 +119,8 @@ pub enum EndpointConnectionType {
 pub enum HighAvailabilityType {
     Regional,
     Zonal,
+    #[serde(rename = "HIGH_AVAILABILITY_TYPE_UNSPECIFIED")]
+    Unspecified,
 }
 
 /// Component type for price estimation
@@ -453,6 +455,14 @@ pub struct UpdateTidbRequest {
     pub display_name: String,
     pub min_rcu: String,
     pub max_rcu: String,
+}
+
+/// Create backup request body
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBackupRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Update backup setting request body

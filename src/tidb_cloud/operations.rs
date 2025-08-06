@@ -181,6 +181,16 @@ impl TiDBCloudClient {
         self.get(&path, query.as_deref()).await
     }
 
+    /// Create a backup for a TiDB cluster
+    pub async fn create_backup(
+        &mut self,
+        tidb_id: &str,
+        request: &CreateBackupRequest,
+    ) -> TiDBCloudResult<Backup> {
+        let path = PathBuilder::new().tidb_id(tidb_id).backups().build();
+        self.post(&path, Some(request)).await
+    }
+
     /// Delete a backup
     pub async fn delete_backup(&mut self, tidb_id: &str, backup_id: &str) -> TiDBCloudResult<()> {
         let path = PathBuilder::new()
