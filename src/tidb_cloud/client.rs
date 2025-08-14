@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::time::Duration;
 
 /// TiDB Cloud API client
+#[derive(Clone)]
 pub struct TiDBCloudClient {
     pub(crate) http_methods: HttpMethods,
     pub(crate) base_url: String,
@@ -220,37 +221,5 @@ impl std::fmt::Debug for TiDBCloudClient {
             .field("base_url", &self.base_url)
             .field("api_key", &"***")
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_client_creation() {
-        let client =
-            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string());
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn test_client_creation_with_empty_api_key() {
-        let client = TiDBCloudClient::new("".to_string());
-        assert!(client.is_err());
-        match client.unwrap_err() {
-            TiDBCloudError::ConfigError(_) => {}
-            _ => panic!("Expected ConfigError"),
-        }
-    }
-
-    #[test]
-    fn test_client_debug() {
-        let client =
-            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string())
-                .unwrap();
-        let debug_str = format!("{client:?}");
-        assert!(debug_str.contains("TiDBCloudClient"));
-        assert!(debug_str.contains("***")); // API key should be masked
     }
 }

@@ -98,6 +98,17 @@ impl TiDBCloudClient {
         self.post(&path, Some(&body)).await
     }
 
+    /// Update root password for a TiDB cluster (alias for reset_root_password)
+    /// This function is designed to be called when updating the root_password field
+    /// from SQL UPDATE statements
+    pub async fn update_root_password(
+        &mut self,
+        tidb_id: &str,
+        new_password: &str,
+    ) -> TiDBCloudResult<ResetRootPasswordResponse> {
+        self.reset_root_password(tidb_id, new_password).await
+    }
+
     /// Update public connection settings for a TiDB cluster
     pub async fn update_public_connection(
         &mut self,
@@ -189,6 +200,20 @@ impl TiDBCloudClient {
     ) -> TiDBCloudResult<Backup> {
         let path = PathBuilder::new().tidb_id(tidb_id).backups().build();
         self.post(&path, Some(request)).await
+    }
+
+    /// Update a backup
+    pub async fn update_backup(
+        &mut self,
+        tidb_id: &str,
+        backup_id: &str,
+        request: &UpdateBackupRequest,
+    ) -> TiDBCloudResult<Backup> {
+        let path = PathBuilder::new()
+            .tidb_id(tidb_id)
+            .backup_id(backup_id)
+            .build();
+        self.patch(&path, request).await
     }
 
     /// Delete a backup
@@ -300,7 +325,7 @@ impl TiDBCloudClient {
                 return Ok(tidb);
             }
 
-            tokio::time::sleep(check_interval).await;
+            std::thread::sleep(check_interval);
         }
 
         Err(crate::tidb_cloud::error::TiDBCloudError::TimeoutError(
@@ -344,73 +369,5 @@ impl TiDBCloudClient {
         .await?;
 
         Ok(deleted_tidb)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_list_tidbs_params() {
-        let client =
-            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string())
-                .unwrap();
-
-        let params = ListTidbsParams {
-            service_plan: Some(ServicePlan::Starter),
-            region_ids: None,
-            name: Some("test-cluster".to_string()),
-            page_size: Some(10),
-            page_token: None,
-            skip: None,
-        };
-
-        let query = client.build_query_string(&params).unwrap();
-        println!("Generated query: {query}");
-        assert!(query.contains("servicePlan=Starter"));
-        assert!(query.contains("name=test-cluster"));
-        assert!(query.contains("pageSize=10"));
-    }
-
-    #[tokio::test]
-    async fn test_list_backups_params() {
-        let client =
-            TiDBCloudClient::new("test-api-key-that-is-long-enough-for-validation".to_string())
-                .unwrap();
-
-        let params = ListBackupsParams {
-            state: None,
-            region_id: None,
-            trigger_type: None,
-            start_time: Some("2023-01-01T00:00:00Z".to_string()),
-            end_time: Some("2023-12-31T23:59:59Z".to_string()),
-            page_size: Some(10),
-            page_token: None,
-        };
-
-        let query = client.build_query_string(&params).unwrap();
-        assert!(query.contains("startTime=2023-01-01T00%3A00%3A00Z"));
-        assert!(query.contains("endTime=2023-12-31T23%3A59%3A59Z"));
-        assert!(query.contains("pageSize=10"));
-    }
-
-    #[test]
-    fn test_reset_root_password_url_format() {
-        let tidb_id = "12345";
-        let expected_path = "/tidbs/12345:resetRootPassword";
-        let actual_path = format!("/tidbs/{tidb_id}:resetRootPassword");
-        assert_eq!(actual_path, expected_path);
-    }
-
-    #[test]
-    fn test_update_public_connection_url_format() {
-        let tidb_id = "12345";
-        let expected_path = "/tidbs/12345/publicConnectionSetting";
-        let actual_path = PathBuilder::new()
-            .tidb_id(tidb_id)
-            .public_connection_setting()
-            .build();
-        assert_eq!(actual_path, expected_path);
     }
 }

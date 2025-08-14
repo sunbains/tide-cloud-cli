@@ -449,18 +449,31 @@ pub struct ListBackupsParams {
 // ============================================================================
 
 /// Update TiDB request body
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTidbRequest {
-    pub display_name: String,
-    pub min_rcu: String,
-    pub max_rcu: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_rcu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rcu: Option<String>,
 }
 
 /// Create backup request body
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBackupRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Update backup request body
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateBackupRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }

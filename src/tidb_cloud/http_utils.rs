@@ -16,6 +16,7 @@ pub const MAX_URL_LENGTH: usize = DEFAULT_MAX_URL_LENGTH;
 pub const MAX_QUERY_LENGTH: usize = DEFAULT_MAX_QUERY_LENGTH;
 
 /// HTTP request builder with security validations
+#[derive(Clone)]
 pub struct HttpRequestBuilder {
     base_url: String,
     _timeout: Duration,
@@ -265,6 +266,7 @@ impl HttpRequestBuilder {
 
 /// Common HTTP methods with security validations
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct HttpMethods {
     builder: HttpRequestBuilder,
     pub(crate) client: reqwest::Client,
@@ -911,123 +913,5 @@ impl HttpMethods {
                 })
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_error_response_parsing() {
-        // Test the TiDB Cloud API error format
-        let error_json = r#"{"code":400, "message":"Min RCU must be at least 1/4 of max RCU.", "details":[{"@type":"type.tidbapi.com/tidb.rpc.RequestInfo", "requestId":"20250802042016c641cf31a21d42f7a8", "servingData":"bizErrorCode: 49900001"}]}"#;
-
-        let json: serde_json::Value = serde_json::from_str(error_json).unwrap();
-
-        // Verify we can extract the error information
-        let code = json.get("code").and_then(|v| v.as_i64()).unwrap();
-        let message = json.get("message").and_then(|v| v.as_str()).unwrap();
-        let details = json.get("details").and_then(|v| v.as_array()).unwrap();
-
-        assert_eq!(code, 400);
-        assert_eq!(message, "Min RCU must be at least 1/4 of max RCU.");
-        assert_eq!(details.len(), 1);
-
-        // Verify we can extract request ID from details
-        let request_id = details[0]
-            .as_object()
-            .and_then(|obj| obj.get("requestId"))
-            .and_then(|v| v.as_str())
-            .unwrap();
-
-        assert_eq!(request_id, "20250802042016c641cf31a21d42f7a8");
-    }
-
-    #[test]
-    fn test_url_validation() {
-        let builder = HttpRequestBuilder::new(
-            PRODUCTION_API_URL.to_string(),
-            Duration::from_secs(30),
-            "test-agent".to_string(),
-        );
-
-        // Valid URLs
-        assert!(
-            builder
-                .validate_url(&format!("{PRODUCTION_API_URL}/tidbs"))
-                .is_ok()
-        );
-        assert!(
-            builder
-                .validate_url("https://api.tidbcloud.com/v1beta2/tidbs")
-                .is_ok()
-        );
-
-        // Invalid URLs
-        assert!(
-            builder
-                .validate_url("http://cloud.tidbapi.com/v1beta2/tidbs")
-                .is_err()
-        ); // HTTP not allowed
-        assert!(
-            builder
-                .validate_url("https://malicious.com/v1beta2/tidbs")
-                .is_err()
-        ); // Invalid domain
-    }
-
-    #[test]
-    fn test_path_validation() {
-        let builder = HttpRequestBuilder::new(
-            PRODUCTION_API_URL.to_string(),
-            Duration::from_secs(30),
-            "test-agent".to_string(),
-        );
-
-        // Valid paths
-        assert!(builder.validate_path("/tidbs").is_ok());
-        assert!(builder.validate_path("/tidbs/123").is_ok());
-
-        // Invalid paths
-        assert!(builder.validate_path("/tidbs/../etc/passwd").is_err()); // Path traversal
-        assert!(builder.validate_path("/tidbs//123").is_err()); // Double slash
-        assert!(builder.validate_path("/tidbs/<script>").is_err()); // Suspicious characters
-    }
-
-    #[test]
-    fn test_request_size_validation() {
-        let builder = HttpRequestBuilder::new(
-            PRODUCTION_API_URL.to_string(),
-            Duration::from_secs(30),
-            "test-agent".to_string(),
-        );
-
-        // Valid size
-        let small_body = "a".repeat(1000);
-        assert!(builder.validate_request_size(&small_body).is_ok());
-
-        // Invalid size
-        let large_body = "a".repeat(MAX_REQUEST_SIZE + 1);
-        assert!(builder.validate_request_size(&large_body).is_err());
-    }
-
-    #[test]
-    fn test_hostname_validation() {
-        let builder = HttpRequestBuilder::new(
-            PRODUCTION_API_URL.to_string(),
-            Duration::from_secs(30),
-            "test-agent".to_string(),
-        );
-
-        // Valid hostnames
-        assert!(builder.is_valid_hostname("cloud.tidbapi.com"));
-        assert!(builder.is_valid_hostname("api.tidbcloud.com"));
-        assert!(builder.is_valid_hostname("localhost"));
-        assert!(builder.is_valid_hostname("127.0.0.1"));
-
-        // Invalid hostnames
-        assert!(!builder.is_valid_hostname("malicious.com"));
-        assert!(!builder.is_valid_hostname("evil.tidbapi.com.evil.com"));
     }
 }

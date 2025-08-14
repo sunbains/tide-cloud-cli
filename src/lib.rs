@@ -1,4 +1,3 @@
-pub mod dsl;
 pub mod logging;
-pub mod schema;
+pub mod sqlite;
 pub mod tidb_cloud;

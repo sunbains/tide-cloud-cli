@@ -1,45 +1,41 @@
 use clap::{Parser, Subcommand};
 use colored::*;
-use edit::edit;
-use rustyline::{DefaultEditor, error::ReadlineError};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tidb_cli::{
-    dsl::{DSLExecutor, UnifiedParser},
-    logging::{LogConfig, init_logging},
-    tidb_cloud::{DebugLogger, TiDBCloudClient, constants::VerbosityLevel},
-};
-
-use tokio::signal;
+use std::path::PathBuf;
 use tracing::Level;
+
+use tidb_cli::{
+    logging::{LogConfig, init_logging},
+    sqlite::{SQLiteConnection, register_module},
+    tidb_cloud::TiDBCloudClient,
+};
 
 #[derive(Parser)]
 #[command(name = "tidb-cli")]
-#[command(about = "TiDB Cloud DSL Command Line Interface")]
-#[command(version)]
+#[command(about = "TiDB Cloud CLI with SQL interface")]
+#[command(long_about = None)]
 struct Cli {
-    /// TiDB Cloud username
+    /// TiDB Cloud username or API key
     #[arg(short, long)]
     username: Option<String>,
 
-    /// TiDB Cloud password/API key
+    /// TiDB Cloud password or API secret
     #[arg(short, long)]
     password: Option<String>,
 
-    /// TiDB Cloud API base URL (include API version path, e.g., https://cloud.dev.tidbapi.com/v1beta2)
-    #[arg(long)]
+    /// TiDB Cloud base URL
+    #[arg(long, default_value = "https://cloud.dev.tidbapi.com/v1beta2")]
     base_url: Option<String>,
-
-    /// Enable verbose output
-    #[arg(short, long)]
-    verbose: bool,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 
     /// Enable file logging
     #[arg(long)]
@@ -49,63 +45,39 @@ struct Cli {
     #[arg(long)]
     log_file_path: Option<String>,
 
-    /// Timeout in seconds for operations
-    #[arg(short, long, default_value = "300")]
-    timeout: u64,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Execute one or more DSL commands (separated by semicolons)
-    Exec {
-        /// The DSL command(s) to execute
-        command: String,
+    /// Execute a SQL query
+    Query {
+        /// SQL query to execute
+        query: String,
     },
-
-    /// Execute a DSL script from a file
+    /// Execute a SQL script from file
     Script {
-        /// Path to the DSL script file
+        /// Path to SQL script file
         file: String,
     },
-
-    /// Validate a DSL script without executing it
-    Validate {
-        /// Path to the DSL script file
-        file: String,
+    /// Setup virtual tables
+    Setup {
+        /// Setup virtual tables
+        tables: bool,
     },
-
-    /// List all available commands
-    List,
-
-    /// Show detailed command syntax with diagrams
-    ShowHelp,
-
-    /// Show DSL syntax examples
+    /// Show available virtual tables
+    ShowTables,
+    /// Show example queries
     Examples,
-
-    /// Edit and execute a DSL command
-    Edit {
-        /// The initial DSL command to edit
-        command: Option<String>,
-
-        /// Open editor with empty content
-        #[arg(long)]
-        empty: bool,
-
-        /// Editor to use (default: $EDITOR or 'nano')
-        #[arg(long)]
-        editor: Option<String>,
-    },
+    /// Start interactive SQL shell
+    Shell,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Initialize logging system
+    // Initialize logging
     let level = match cli.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
@@ -126,1420 +98,476 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_logging(&log_config)?;
 
-    // Check if we need authentication for the command
-    let needs_auth = matches!(
-        cli.command,
-        Some(Commands::Exec { .. }) | Some(Commands::Script { .. }) | None
-    );
+    // Create TiDB Cloud client
+    let client = create_tidb_client(&cli)?;
 
-    let mut executor = if needs_auth {
-        // Get username and password
-        let username = cli
-            .username
-            .or_else(|| env::var("TIDB_CLOUD_USERNAME").ok())
-            .unwrap_or_else(|| "tidb_cloud_user".to_string());
-
-        let password = cli.password
-            .or_else(|| env::var("TIDB_CLOUD_PASSWORD").ok())
-            .or_else(|| env::var("TIDB_CLOUD_API_KEY").ok()) // Backward compatibility
-            .ok_or("TIDB_CLOUD_PASSWORD or TIDB_CLOUD_API_KEY must be provided via --password or environment variable")?;
-
-        // Create TiDB Cloud client with username and password
-        let base_url = cli
-            .base_url
-            .unwrap_or_else(|| "https://cloud.tidbapi.com/v1beta2".to_string());
-        // Use the base URL as-is, don't append API version (let the user specify the complete URL)
-        let full_base_url = base_url;
-        // Create DebugLogger with the same level as the tracing system
-        let debug_logger = match cli.log_level.as_str() {
-            "trace" => DebugLogger::new(VerbosityLevel::Trace),
-            "debug" => DebugLogger::new(VerbosityLevel::Debug),
-            "info" => DebugLogger::new(VerbosityLevel::Info),
-            "warn" => DebugLogger::new(VerbosityLevel::Warning),
-            "error" => DebugLogger::new(VerbosityLevel::Error),
-            _ => DebugLogger::new(VerbosityLevel::Info),
-        };
-
-        let client = TiDBCloudClient::with_config_and_credentials(
-            username,
-            password,
-            full_base_url,
-            std::time::Duration::from_secs(cli.timeout),
-            debug_logger,
-        )?;
-
-        // Create DSL executor with timeout
-        let timeout = std::time::Duration::from_secs(cli.timeout);
-        Some(DSLExecutor::with_timeout(client, timeout))
-    } else {
-        None
-    };
-
-    // Set up signal handling for Ctrl+C
-    let cancellation_flag = if let Some(ref mut exec) = executor {
-        exec.get_cancellation_flag()
-    } else {
-        Arc::new(AtomicBool::new(false))
-    };
-
-    // Spawn signal handler
-    let signal_flag = Arc::clone(&cancellation_flag);
-    tokio::spawn(async move {
-        if let Ok(()) = signal::ctrl_c().await {
-            println!("\nReceived Ctrl+C, cancelling current command...");
-            signal_flag.store(true, Ordering::Relaxed);
-        }
-    });
-
+    // Handle commands
     match cli.command {
-        Some(Commands::Exec { command }) => {
-            // Split command by semicolons to handle multiple commands
-            let commands = split_commands(&command);
-            execute_multiple_commands(executor.as_mut().unwrap(), &commands).await?;
+        Some(Commands::Query { query }) => {
+            execute_sql_query(&query, &client)?;
         }
-
         Some(Commands::Script { file }) => {
-            execute_script_file(executor.as_mut().unwrap(), &file).await?;
+            execute_sql_script(&file, &client)?;
         }
-
-        None => {
-            run_interactive_mode(executor.as_mut().unwrap()).await?;
+        Some(Commands::Setup { tables }) => {
+            if tables {
+                setup_virtual_tables(&client)?;
+            }
         }
-
-        Some(Commands::Validate { file }) => {
-            validate_script_file(&file)?;
+        Some(Commands::ShowTables) => {
+            show_virtual_tables()?;
         }
-
-        Some(Commands::List) => {
-            list_available_commands();
-        }
-
-        Some(Commands::ShowHelp) => {
-            show_detailed_command_help();
-        }
-
         Some(Commands::Examples) => {
             show_examples();
         }
-
-        Some(Commands::Edit {
-            command,
-            empty,
-            editor,
-        }) => {
-            execute_edit_command(
-                executor.as_mut().unwrap(),
-                command,
-                empty,
-                editor.as_deref(),
-            )
-            .await?;
+        Some(Commands::Shell) => {
+            interactive_shell(&client)?;
+        }
+        None => {
+            // Default to interactive shell
+            interactive_shell(&client)?;
         }
     }
 
     Ok(())
 }
 
-/// Split input into individual commands by semicolon
-fn split_commands(input: &str) -> Vec<String> {
-    input
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+fn create_tidb_client(cli: &Cli) -> Result<TiDBCloudClient, Box<dyn std::error::Error>> {
+    let username = cli
+        .username
+        .clone()
+        .or_else(|| env::var("TIDB_USERNAME").ok())
+        .ok_or(
+            "Username not provided. Use --username or set TIDB_USERNAME environment variable.",
+        )?;
+
+    let password = cli.password.clone().or_else(|| env::var("TIDB_PASSWORD").ok())
+        .ok_or("Password/API key not provided. Use --password or set TIDB_PASSWORD environment variable.")?;
+
+    let base_url = cli
+        .base_url
+        .clone()
+        .or_else(|| env::var("TIDB_BASE_URL").ok())
+        .unwrap_or_else(|| "https://cloud.dev.tidbapi.com/v1beta2".to_string());
+
+    use std::time::Duration;
+    use tidb_cli::tidb_cloud::debug_logger::DebugLogger;
+
+    let client = TiDBCloudClient::with_config_and_credentials(
+        username,
+        password,
+        base_url,
+        Duration::from_secs(30),
+        DebugLogger::default(),
+    )?;
+    Ok(client)
 }
 
-async fn execute_multiple_commands(
-    executor: &mut DSLExecutor,
-    commands: &[String],
+fn execute_sql_query(
+    query: &str,
+    client: &TiDBCloudClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (i, command) in commands.iter().enumerate() {
-        if commands.len() > 1 {
-            println!(
-                "Executing command {} of {}: {}",
-                i + 1,
-                commands.len(),
-                command
-            );
-        }
+    println!("{}", "Executing SQL query:".green());
+    println!("{query}");
+    println!();
 
-        execute_single_command(executor, command).await?;
-    }
-    Ok(())
-}
+    // Create SQLite connection with virtual tables
+    let mut conn = SQLiteConnection::new_in_memory()?;
+    register_module(&conn, client)?;
 
-async fn execute_single_command(
-    executor: &mut DSLExecutor,
-    command: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use tracing::{debug, error, info};
+    // Create virtual tables
+    setup_virtual_tables_in_connection(&mut conn)?;
 
-    info!("Executing DSL command: {}", command);
-    debug!("Parsing command: {}", command);
+    // Execute the query
+    let mut stmt = conn.prepare(query)?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt.query([])?;
 
-    // Use direct AST parsing and execution
-    match UnifiedParser::parse(command) {
-        Ok(ast_node) => {
-            debug!("Command parsed successfully to AST: {:?}", ast_node);
-
-            match executor.execute_ast(&ast_node).await {
-                Ok(result) => {
-                    if result.is_success() {
-                        info!("✅ Command executed successfully");
-                        if let Some(message) = result.get_message() {
-                            debug!("Command has message");
-                            println!("{message}");
-                        }
-                        if let Some(data) = result.get_data() {
-                            debug!("Command data: {}", data);
-                            let pretty_data = executor.pretty_print_table(data);
-                            println!("Data:\n{pretty_data}");
-                        }
-                        if let Some(duration) = result.get_metadata("duration_ms")
-                            && let Some(duration_ms) = duration.as_number()
-                        {
-                            debug!("Command duration: {:.2}ms", duration_ms);
-                            println!("Duration: {duration_ms:.2}ms");
-                        }
-                    } else {
-                        error!("❌ Command failed");
-                        if let Some(error) = result.get_error() {
-                            error!("Command error: {}", error);
-                            println!("Error: {error}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Command execution failed: {}", e);
-                    println!("❌ Command execution failed: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            error!("❌ Command parsing failed: {}", e);
-            println!("❌ Command parsing failed: {e}");
-        }
+    // Display results
+    println!("{}", "Query Results:".green());
+    while let Some(row) = rows.next()? {
+        let values: Vec<String> = (0..column_count)
+            .map(|i| row.get::<_, String>(i).unwrap_or_default())
+            .collect();
+        println!("| {}", values.join(" | "));
     }
 
     Ok(())
 }
 
-async fn execute_script_file(
-    executor: &mut DSLExecutor,
+fn execute_sql_script(
     file_path: &str,
+    client: &TiDBCloudClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !Path::new(file_path).exists() {
-        return Err(format!("Script file '{file_path}' not found").into());
-    }
+    let content = std::fs::read_to_string(file_path)?;
+    println!("{}", format!("Executing SQL script: {file_path}").green());
 
-    let script_content = fs::read_to_string(file_path)?;
-    println!("Executing script from: {file_path}");
+    // Create SQLite connection with virtual tables
+    let mut conn = SQLiteConnection::new_in_memory()?;
+    register_module(&conn, client)?;
 
-    match executor.execute_ast_script(&script_content).await {
-        Ok(batch_result) => {
-            println!("✅ Script executed successfully");
-            println!(
-                "Results: {} successful, {} failed",
-                batch_result.success_count, batch_result.failure_count
-            );
-            println!("Total duration: {:?}", batch_result.total_duration);
+    // Create virtual tables
+    setup_virtual_tables_in_connection(&mut conn)?;
 
-            // Show detailed results
-            for (i, result) in batch_result.results.iter().enumerate() {
-                let status = if result.is_success() { "✅" } else { "❌" };
-                println!("Command {}: {}", i + 1, status);
+    // Execute the script
+    conn.execute_batch(&content)?;
 
-                if let Some(message) = result.get_message() {
-                    println!("  Message: {message}");
-                }
+    println!("{}", "Script executed successfully!".green());
+    Ok(())
+}
 
-                if let Some(error) = result.get_error() {
-                    println!("  Error: {error}");
-                }
-            }
+fn setup_virtual_tables(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Setting up virtual tables...".green());
 
-            // Show variables at the end
-            if !executor.get_variables().is_empty() {
-                println!("\nVariables:");
-                for (name, value) in executor.get_variables() {
-                    println!("  {name} = {value}");
-                }
-            }
-        }
-        Err(e) => {
-            println!("❌ Script execution failed: {e}");
-        }
-    }
+    // Create SQLite connection
+    let mut conn = SQLiteConnection::new_in_memory()?;
+    register_module(&conn, client)?;
+
+    // Create virtual tables
+    setup_virtual_tables_in_connection(&mut conn)?;
+
+    println!("{}", "Virtual tables created successfully!".green());
+    println!("You can now run SQL queries against TiDB Cloud data.");
 
     Ok(())
 }
 
-async fn run_interactive_mode(
-    executor: &mut DSLExecutor,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("TiDB Cloud CLI Interactive Mode");
-    println!("Type 'help' for available commands, 'exit' to quit");
-    println!("Use Ctrl+R to search history, Ctrl+L to clear screen");
-    println!("================================================");
+/// Parse DELETE statement to extract table name and WHERE clause
+fn parse_delete_statement(
+    input: &str,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    let input = input.trim().to_uppercase();
 
-    // Create rustyline editor with history
+    // Find the table name after DELETE FROM
+    if let Some(from_pos) = input.find("FROM") {
+        let after_from = &input[from_pos + 4..];
+        let parts: Vec<&str> = after_from.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return Err("No table name found after FROM".into());
+        }
+
+        let table_name = parts[0].to_lowercase();
+
+        // Check if there's a WHERE clause
+        if let Some(where_pos) = after_from.find("WHERE") {
+            let where_clause = after_from[where_pos + 6..].trim();
+            Ok((table_name, Some(where_clause.to_string())))
+        } else {
+            Ok((table_name, None))
+        }
+    } else {
+        Err("No FROM clause found in DELETE statement".into())
+    }
+}
+
+/// Fetch fresh data from TiDB Cloud API and populate SQLite tables
+fn fetch_fresh_data_from_api(
+    conn: &mut SQLiteConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Fetching fresh data from TiDB Cloud API...");
+
+    // Note: We're now using virtual tables, so no need to manually populate data
+    // The virtual tables will handle data fetching on-demand
+    println!("Note: Using virtual tables for on-demand data access");
+
+    // Create a simple config table for status
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            raw_data TEXT
+        );
+        INSERT OR REPLACE INTO config (key, value, raw_data) VALUES 
+        ('api_status', 'virtual_table_mode', '{"mode": "vtab", "note": "Using virtual tables for data access"}');
+        "#,
+    )?;
+
+    println!("Virtual tables ready for data access");
+    Ok(())
+}
+
+/// Setup virtual tables in the given connection
+fn setup_virtual_tables_in_connection(
+    conn: &mut SQLiteConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create the virtual table instances
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS tidb_clusters USING tidb_clusters;
+        CREATE VIRTUAL TABLE IF NOT EXISTS tidb_backups USING tidb_backups;
+        "#,
+    )?;
+
+    // Create the public_endpoints view using the virtual table
+    conn.execute_batch(
+        r#"
+        CREATE VIEW IF NOT EXISTS public_endpoints AS 
+        SELECT 
+            c.tidb_id,
+            json_extract(endpoints.value, '$.type') as endpoint_type,
+            json_extract(endpoints.value, '$.address') as address,
+            json_extract(endpoints.value, '$.port') as port,
+            json_extract(endpoints.value, '$.subnet') as subnet,
+            endpoints.value as raw_data
+        FROM tidb_clusters c, json_each(c.raw_data, '$.endpoints') as endpoints;
+        "#,
+    )?;
+
+    // Populate with fresh data
+    fetch_fresh_data_from_api(conn)?;
+
+    Ok(())
+}
+
+fn show_virtual_tables() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Available Virtual Tables:".green());
+    println!();
+    println!("{}", "1. tidb_clusters".blue());
+    println!("   - Contains TiDB cluster information");
+    println!(
+        "   - Fields: tidb_id, name, display_name, region_id, state, create_time, root_password, min_rcu, max_rcu, service_plan, cloud_provider, region_display_name, raw_data"
+    );
+    println!("   - Supports WHERE constraints on: state, region_id, cloud_provider");
+    println!();
+    println!("{}", "2. tidb_backups".blue());
+    println!("   - Contains backup information for clusters");
+    println!("   - Fields: backup_id, tidb_id, backup_name, status, size_bytes, raw_data");
+    println!("   - Supports WHERE constraints on: tidb_id");
+    println!();
+    println!("{}", "3. config".blue());
+    println!("   - Contains configuration and metadata");
+    println!("   - Fields: key, value, raw_data");
+    println!();
+    println!("{}", "4. public_endpoints (View)".blue());
+    println!("   - Materialized view of cluster endpoints");
+    println!("   - Extracted from tidb_clusters.raw_data JSON field");
+    println!("   - Fields: tidb_id, endpoint_type, address, port, subnet, raw_data");
+    println!();
+    println!("{}", "Example Queries:".yellow());
+    println!("  SELECT * FROM tidb_clusters WHERE state = 'ACTIVE';");
+    println!("  SELECT display_name, min_rcu, max_rcu FROM tidb_clusters;");
+    println!("  SELECT * FROM tidb_backups WHERE tidb_id = 'your_cluster_id';");
+    println!("  SELECT * FROM public_endpoints WHERE endpoint_type = 'TIDB';");
+    println!();
+    println!("{}", "Note:".red());
+    println!("  - All input is passed directly to SQLite for execution");
+    println!("  - True virtual tables with on-demand data access");
+    println!("  - SQLite handles constraint optimization via best_index");
+    println!("  - Materialized view for complex data extraction");
+
+    Ok(())
+}
+
+fn show_examples() {
+    println!("{}", "TiDB Cloud SQL Examples:".green());
+    println!();
+    println!("{}", "Basic Queries:".blue());
+    println!("  SELECT * FROM tidb_clusters;");
+    println!("  SELECT display_name, state FROM tidb_clusters WHERE state = 'ACTIVE';");
+    println!("  SELECT COUNT(*) FROM tidb_clusters;");
+    println!();
+    println!("{}", "Backup Operations:".blue());
+    println!("  SELECT * FROM tidb_backups;");
+    println!("  SELECT backup_name, status FROM tidb_backups WHERE tidb_id = 'your_cluster_id';");
+    println!();
+    println!("{}", "Complex Queries:".blue());
+    println!("  SELECT c.display_name, COUNT(b.backup_id) as backup_count");
+    println!("  FROM tidb_clusters c");
+    println!("  LEFT JOIN tidb_backups b ON c.tidb_id = b.tidb_id");
+    println!("  WHERE c.state = 'ACTIVE';");
+    println!();
+    println!("{}", "Ordering and Limiting:".blue());
+    println!(
+        "  SELECT display_name, create_time FROM tidb_clusters ORDER BY create_time DESC LIMIT 10;"
+    );
+    println!("  SELECT * FROM backups ORDER BY create_time DESC LIMIT 5;");
+}
+
+fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "TiDB Cloud SQL Shell".green());
+    println!("All input is passed directly to SQLite for execution");
+    println!("Type 'quit' or 'exit' to exit the shell");
+    println!();
+
     let mut rl = DefaultEditor::new()?;
 
-    // Set history file path
-    let history_file = get_history_file_path()?;
-
-    // Load history if file exists
-    if history_file.exists()
-        && let Err(e) = rl.load_history(&history_file)
-    {
-        tracing::warn!("Could not load history file: {}", e);
+    // Load command history
+    if let Err(err) = rl.load_history("tidb_cli_history.txt") {
+        // It's okay if the history file doesn't exist yet
+        if !matches!(err, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            eprintln!("Failed to load history: {err}");
+        }
     }
 
+    // Create SQLite connection with virtual tables
+    let mut conn = SQLiteConnection::new_in_memory()?;
+    register_module(&conn, client)?;
+
+    // Create virtual tables
+    setup_virtual_tables_in_connection(&mut conn)?;
+
     loop {
-        let readline = rl.readline("tidb-dsl> ");
+        let readline = rl.readline("tidb-sql> ");
+
         match readline {
             Ok(line) => {
-                let input = line.trim();
-                if input.is_empty() {
+                let line = line.trim();
+
+                if line.is_empty() {
                     continue;
                 }
 
-                // Add to history (rustyline does this automatically, but we can be explicit)
-                if let Err(e) = rl.add_history_entry(input) {
-                    tracing::warn!("Could not add to history: {}", e);
-                }
-
-                match input.to_lowercase().as_str() {
-                    "exit" | "quit" => {
+                match line.to_lowercase().as_str() {
+                    "help" | "h" => {
+                        if let Err(e) = show_virtual_tables() {
+                            println!("{}: {}", "Error".red(), e);
+                        }
+                    }
+                    "quit" | "exit" | "q" => {
                         println!("Goodbye!");
                         break;
                     }
-                    "help" => {
-                        show_interactive_help();
-                    }
-                    "help commands" => {
-                        show_detailed_command_help();
-                    }
-                    "help examples" => {
-                        show_examples();
-                    }
-                    "variables" => {
-                        show_variables(executor);
-                    }
-                    "clear" => {
-                        executor.clear_variables();
-                        println!("Variables cleared");
-                    }
-                    "history" => {
-                        show_history(&rl);
-                    }
-                    "clear-history" => {
-                        if let Err(e) = rl.clear_history() {
-                            tracing::warn!("Could not clear history: {}", e);
-                        } else {
-                            println!("History cleared");
-                        }
-                    }
-                    "edit" => {
-                        if let Err(e) = execute_edit_command(executor, None, false, None).await {
-                            println!("Error: {e}");
-                        }
-                    }
                     _ => {
-                        // Reset cancellation flag before executing command
-                        executor.reset_cancellation();
-
-                        // Split input by semicolons to handle multiple commands
-                        let commands = split_commands(input);
-
-                        if let Err(e) = execute_multiple_commands(executor, &commands).await {
-                            if e.to_string().contains("cancelled") {
-                                println!("Command cancelled");
-                            } else {
-                                println!("Error: {e}");
-                            }
+                        // Execute SQL query (or any other SQLite command)
+                        if let Err(e) = execute_query_in_shell(line, &mut conn) {
+                            println!("{}: {}", "Error".red(), e);
                         }
                     }
+                }
+
+                // Add line to history
+                if let Err(err) = rl.add_history_entry(line) {
+                    eprintln!("Failed to add to history: {err}");
                 }
             }
             Err(ReadlineError::Interrupted) => {
                 println!("^C");
-                continue;
+                break;
             }
             Err(ReadlineError::Eof) => {
                 println!("^D");
                 break;
             }
             Err(err) => {
-                println!("Error: {err}");
+                println!("{}: {}", "Error".red(), err);
                 break;
             }
         }
     }
 
-    // Save history
-    if let Err(e) = rl.save_history(&history_file) {
-        tracing::warn!("Could not save history file: {}", e);
+    // Save command history
+    if let Err(err) = rl.save_history("tidb_cli_history.txt") {
+        eprintln!("Failed to save history: {err}");
     }
 
     Ok(())
 }
 
-fn validate_script_file(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !Path::new(file_path).exists() {
-        return Err(format!("Script file '{file_path}' not found").into());
-    }
-
-    let script_content = fs::read_to_string(file_path)?;
-    println!("Validating script: {file_path}");
-
-    match UnifiedParser::parse_script(&script_content) {
-        Ok(ast_nodes) => {
-            println!("✅ Script is valid");
-            println!("Found {} AST nodes:", ast_nodes.len());
-
-            for (i, node) in ast_nodes.iter().enumerate() {
-                println!("  {}. {}", i + 1, node.variant_name());
-            }
-        }
-        Err(e) => {
-            println!("❌ Script validation failed: {e}");
-        }
-    }
-
-    Ok(())
-}
-
-fn list_available_commands() {
-    println!("Available DSL Commands:");
-    println!("=======================");
-    println!();
-    println!("Cluster Management:");
-    println!("  CREATE CLUSTER <name> IN <region> [WITH <params>]");
-    println!("  DELETE CLUSTER <name>");
-    println!("  LIST CLUSTERS [WHERE <conditions>]");
-    println!("  GET CLUSTER <name>");
-    println!("  UPDATE CLUSTER <name> WITH <params>");
-    println!("  WAIT FOR <cluster> TO BE <state> [WITH timeout=<seconds>]");
-    println!();
-    println!("Backup Management:");
-    println!("  CREATE BACKUP FOR <cluster> [WITH description=<desc>]");
-    println!("  LIST BACKUPS FOR <cluster>");
-    println!("  DELETE BACKUP <backup_id> FROM <cluster>");
-    println!();
-    println!("Pricing:");
-    println!(
-        "  ESTIMATE PRICE IN <region> WITH min_rcu=<value>, max_rcu=<value>, service_plan=<plan>"
-    );
-    println!();
-    println!("Variables:");
-    println!("  SET <variable> = <value>");
-    println!("  GET <variable>");
-    println!();
-    println!("Control Flow:");
-    println!("  IF <condition> THEN <commands> [ELSE <commands>] END");
-    println!("  LOOP <commands> END");
-    println!("  BREAK");
-    println!("  CONTINUE");
-    println!("  RETURN [<value>]");
-    println!();
-    println!("Utility:");
-    println!("  ECHO <message>");
-    println!("  SLEEP <seconds>");
-    println!("  EXIT");
-    println!();
-    println!("Examples:");
-    println!(
-        "  CREATE CLUSTER my-cluster IN aws-us-west-1 WITH min_rcu=1, max_rcu=10, service_plan=Starter"
-    );
-    println!("  WAIT FOR my-cluster TO BE ACTIVE WITH timeout=600");
-    println!("  SET region = \"aws-us-west-1\"");
-    println!("  ECHO \"Cluster created successfully!\"");
-}
-
-fn show_examples() {
-    println!("DSL Syntax Examples:");
-    println!("===================");
-    println!();
-
-    let examples = vec![
-        (
-            "Basic Cluster Operations",
-            r#"
-# Create a cluster
-CREATE CLUSTER my-cluster IN aws-us-west-1 WITH min_rcu=1, max_rcu=10, service_plan=STARTER
-
-# Wait for cluster to be active
-WAIT FOR my-cluster TO BE ACTIVE WITH timeout=600
-
-# List all clusters
-LIST CLUSTERS
-
-# Get specific cluster details
-GET CLUSTER my-cluster
-
-# Update cluster
-UPDATE CLUSTER my-cluster WITH max_rcu=20
-
-# Delete cluster
-DELETE CLUSTER my-cluster"#,
-        ),
-        (
-            "Backup Operations",
-            r#"
-# Create a backup
-CREATE BACKUP FOR my-cluster WITH description="Daily backup"
-
-# List backups
-LIST BACKUPS FOR my-cluster
-
-# Delete a backup
-DELETE BACKUP backup-123 FROM my-cluster"#,
-        ),
-        (
-            "Pricing",
-            r#"
-# Estimate price
-ESTIMATE PRICE IN aws-us-west-1 WITH min_rcu=1, max_rcu=10, service_plan=STARTER"#,
-        ),
-        (
-            "Variables and Control Flow",
-            r#"
-# Set variables
-SET region = "aws-us-west-1"
-SET cluster_name = "my-cluster"
-
-# Use variables
-CREATE CLUSTER ${cluster_name} IN ${region}
-
-# Conditional execution
-IF ${cluster_exists} THEN
-    ECHO "Cluster already exists"
-ELSE
-    CREATE CLUSTER ${cluster_name} IN ${region}
-END"#,
-        ),
-        (
-            "Script Example",
-            r#"
-# Complete script example
-SET region = "aws-us-west-1"
-SET cluster_name = "test-cluster"
-
-ECHO "Creating cluster ${cluster_name} in ${region}"
-
-CREATE CLUSTER ${cluster_name} IN ${region} WITH min_rcu=1, max_rcu=10, service_plan=STARTER
-
-WAIT FOR ${cluster_name} TO BE ACTIVE WITH timeout=600
-
-ECHO "Cluster ${cluster_name} is now active!"
-
-CREATE BACKUP FOR ${cluster_name} WITH description="Initial backup"
-
-ECHO "Backup created successfully"
-
-LIST BACKUPS FOR ${cluster_name}"#,
-        ),
-    ];
-
-    for (title, example) in examples {
-        println!("{title}:");
-        println!("{example}");
-        println!();
-    }
-}
-
-fn show_detailed_command_help() {
-    println!("{}", "TiDB Cloud DSL Command Reference".bold().cyan());
-    println!("{}", "=================================".cyan());
-    println!();
-
-    // Cluster Management Commands
-    println!("{}", "📊 CLUSTER MANAGEMENT".bold().green());
-    println!("{}", "=====================".green());
-    println!();
-
-    // CREATE CLUSTER
-    println!("{}", "CREATE CLUSTER".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ CREATE CLUSTER <name> IN <region> [WITH <parameters>]                               │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Parameters:".bold());
-    println!(
-        "  {}  {}  {}",
-        "min_rcu".cyan(),
-        "=".white(),
-        "Minimum RCU (1-1000)".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "max_rcu".cyan(),
-        "=".white(),
-        "Maximum RCU (1-1000)".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "service_plan".cyan(),
-        "=".white(),
-        "Starter | Essential | Premium | BYOC".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "root_password".cyan(),
-        "=".white(),
-        "Root password for database access".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "high_availability_type".cyan(),
-        "=".white(),
-        "REGIONAL | ZONAL".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "public_connection".cyan(),
-        "=".white(),
-        "Public connection settings object".white()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!(
-        "  CREATE CLUSTER my-cluster IN aws-us-west-1 WITH min_rcu=1, max_rcu=10, service_plan=Starter"
-    );
-    println!(
-        "  CREATE CLUSTER prod-cluster IN aws-us-east-1 WITH min_rcu=100, max_rcu=1000, service_plan=Premium"
-    );
-    println!(
-        "  CREATE CLUSTER my-cluster IN aws-us-west-1 WITH public_connection={{enabled: true, \"ipAccessList\": [{{cidrNotation: \"10.10.1.1/21\", description: \"my ip address\"}}]}}"
-    );
-    println!();
-
-    // LIST CLUSTERS
-    println!("{}", "LIST CLUSTERS".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ LIST CLUSTERS [WHERE <conditions>]                                                  │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  LIST CLUSTERS");
-    println!("  LIST CLUSTERS WHERE state=ACTIVE");
-    println!();
-
-    // GET CLUSTER
-    println!("{}", "GET CLUSTER".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ GET CLUSTER <name>                                                                  │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  GET CLUSTER my-cluster");
-    println!();
-
-    // UPDATE CLUSTER
-    println!("{}", "UPDATE CLUSTER".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ UPDATE CLUSTER <name> WITH <parameters>                                             │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Parameters:".bold());
-    println!(
-        "  {}  {}  {}",
-        "display_name".cyan(),
-        "=".white(),
-        "New display name".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "min_rcu".cyan(),
-        "=".white(),
-        "New minimum RCU".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "max_rcu".cyan(),
-        "=".white(),
-        "New maximum RCU".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "root_password".cyan(),
-        "=".white(),
-        "New root password for database access".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "public_connection".cyan(),
-        "=".white(),
-        "Public connection settings object".white()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  UPDATE CLUSTER my-cluster WITH max_rcu=20");
-    println!("  UPDATE CLUSTER my-cluster WITH display_name=\"Updated Cluster\"");
-    println!("  UPDATE CLUSTER my-cluster WITH root_password=\"newpassword123\"");
-    println!(
-        "  UPDATE CLUSTER my-cluster WITH public_connection={{enabled: true, \"ipAccessList\": [{{cidrNotation: \"10.10.1.1/21\", description: \"my ip address\"}}]}}"
-    );
-    println!();
-
-    // DELETE CLUSTER
-    println!("{}", "DELETE CLUSTER".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ DELETE CLUSTER <name>                                                               │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  DELETE CLUSTER my-cluster");
-    println!();
-
-    // WAIT FOR CLUSTER
-    println!("{}", "WAIT FOR CLUSTER".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ WAIT FOR <cluster> TO BE <state> [WITH timeout=<seconds>]                           │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "States:".bold());
-    println!(
-        "  {}  {}",
-        "ACTIVE".green(),
-        "- Cluster is ready for use".white()
-    );
-    println!(
-        "  {}  {}",
-        "CREATING".yellow(),
-        "- Cluster is being created".white()
-    );
-    println!(
-        "  {}  {}",
-        "DELETING".red(),
-        "- Cluster is being deleted".white()
-    );
-    println!(
-        "  {}  {}",
-        "UPDATING".yellow(),
-        "- Cluster is being updated".white()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  WAIT FOR my-cluster TO BE ACTIVE");
-    println!("  WAIT FOR my-cluster TO BE ACTIVE WITH timeout=600");
-    println!();
-
-    // Backup Management Commands
-    println!("{}", "💾 BACKUP MANAGEMENT".bold().green());
-    println!("{}", "===================".green());
-    println!();
-
-    // CREATE BACKUP
-    println!("{}", "CREATE BACKUP".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ CREATE BACKUP FOR <cluster> [WITH description=<desc>]                               │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  CREATE BACKUP FOR my-cluster");
-    println!("  CREATE BACKUP FOR my-cluster WITH description=\"Daily backup\"");
-    println!();
-
-    // LIST BACKUPS
-    println!("{}", "LIST BACKUPS".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ LIST BACKUPS FOR <cluster>                                                          │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  LIST BACKUPS FOR my-cluster");
-    println!();
-
-    // DELETE BACKUP
-    println!("{}", "DELETE BACKUP".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ DELETE BACKUP <backup_id> FROM <cluster>                                            │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  DELETE BACKUP backup-123 FROM my-cluster");
-    println!();
-
-    // Pricing Commands
-    println!("{}", "💰 PRICING".bold().green());
-    println!("{}", "==========".green());
-    println!();
-
-    // ESTIMATE PRICE
-    println!("{}", "ESTIMATE PRICE".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ ESTIMATE PRICE IN <region> WITH <parameters>                                        │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Parameters:".bold());
-    println!(
-        "  {}  {}  {}",
-        "min_rcu".cyan(),
-        "=".white(),
-        "Minimum RCU (1-1000)".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "max_rcu".cyan(),
-        "=".white(),
-        "Maximum RCU (1-1000)".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "service_plan".cyan(),
-        "=".white(),
-        "STARTER | ESSENTIAL | PREMIUM | BYOC".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "row_storage_size".cyan(),
-        "=".white(),
-        "Row storage size in bytes".white()
-    );
-    println!(
-        "  {}  {}  {}",
-        "column_storage_size".cyan(),
-        "=".white(),
-        "Column storage size in bytes".white()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  ESTIMATE PRICE IN aws-us-west-1 WITH min_rcu=1, max_rcu=10, service_plan=STARTER");
-    println!(
-        "  ESTIMATE PRICE IN aws-us-east-1 WITH min_rcu=100, max_rcu=1000, service_plan=PREMIUM, row_storage_size=1073741824"
-    );
-    println!();
-
-    // Variable Commands
-    println!("{}", "🔧 VARIABLES".bold().green());
-    println!("{}", "============".green());
-    println!();
-
-    // SET VARIABLE
-    println!("{}", "SET VARIABLE".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ SET <variable> = <value>                                                            │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  SET region = \"aws-us-west-1\"");
-    println!("  SET cluster_name = \"my-cluster\"");
-    println!("  SET timeout = 600");
-    println!();
-
-    // GET VARIABLE
-    println!("{}", "GET VARIABLE".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ GET <variable>                                                                      │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  GET region");
-    println!("  GET cluster_name");
-    println!();
-
-    // Control Flow Commands
-    println!("{}", "🔄 CONTROL FLOW".bold().green());
-    println!("{}", "==============".green());
-    println!();
-
-    // IF
-    println!("{}", "IF STATEMENT".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ IF <condition> THEN                                                                 │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│   <commands>                                                                        │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ [ELSE                                                                               │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│   <commands>]                                                                       │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ END                                                                                 │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  IF ${{cluster_exists}} THEN");
-    println!("    ECHO \"Cluster already exists\"");
-    println!("  ELSE");
-    println!("    CREATE CLUSTER ${{cluster_name}} IN ${{region}}");
-    println!("  END");
-    println!();
-
-    // LOOP
-    println!("{}", "LOOP".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ LOOP                                                                                │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│   <commands>                                                                        │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ END                                                                                 │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  LOOP");
-    println!("    GET CLUSTER my-cluster");
-    println!("    SLEEP 30");
-    println!("  END");
-    println!();
-
-    // BREAK/CONTINUE
-    println!("{}", "BREAK/CONTINUE".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ BREAK                                                                               │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ CONTINUE                                                                            │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  IF ${{condition}} THEN");
-    println!("    BREAK");
-    println!("  END");
-    println!();
-
-    // RETURN
-    println!("{}", "RETURN".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ RETURN [<value>]                                                                    │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  RETURN");
-    println!("  RETURN \"success\"");
-    println!();
-
-    // Utility Commands
-    println!("{}", "🛠️  UTILITY".bold().green());
-    println!("{}", "===========".green());
-    println!();
-
-    // ECHO
-    println!("{}", "ECHO".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ ECHO <message>                                                                      │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  ECHO \"Cluster created successfully!\"");
-    println!("  ECHO \"Current region: ${{region}}\"");
-    println!();
-
-    // SLEEP
-    println!("{}", "SLEEP".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ SLEEP <seconds>                                                                     │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  SLEEP 30");
-    println!("  SLEEP 2.5");
-    println!();
-
-    // EXIT
-    println!("{}", "EXIT".bold().yellow());
-    println!(
-        "{}",
-        "┌─────────────────────────────────────────────────────────────────────────────────────┐"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "│ EXIT                                                                                │"
-            .dimmed()
-    );
-    println!(
-        "{}",
-        "└─────────────────────────────────────────────────────────────────────────────────────┘"
-            .dimmed()
-    );
-    println!();
-    println!("{}", "Examples:".bold());
-    println!("  EXIT");
-    println!();
-
-    // Syntax Notes
-    println!("{}", "📝 SYNTAX NOTES".bold().green());
-    println!("{}", "==============".green());
-    println!();
-    println!("{}", "• Variables:".bold());
-    println!("  Use ${{variable_name}} to reference variables in commands");
-    println!("  Example: CREATE CLUSTER ${{cluster_name}} IN ${{region}}");
-    println!();
-    println!("{}", "• Strings:".bold());
-    println!("  Use double quotes for strings: \"my string\"");
-    println!("  Example: SET region = \"aws-us-west-1\"");
-    println!();
-    println!("{}", "• Numbers:".bold());
-    println!("  Numbers can be integers or decimals");
-    println!("  Example: SET timeout = 600, SLEEP 2.5");
-    println!();
-    println!("{}", "• Optional Parameters:".bold());
-    println!("  Parameters in [brackets] are optional");
-    println!("  Example: CREATE CLUSTER name IN region [WITH params]");
-    println!();
-    println!("{}", "• Comments:".bold());
-    println!("  Use # for single-line comments");
-    println!("  Example: # This is a comment");
-    println!();
-
-    println!(
-        "{}",
-        "For more examples, run: tidb-dsl examples".bold().cyan()
-    );
-}
-
-fn show_interactive_help() {
-    println!("Interactive Mode Commands:");
-    println!("=========================");
-    println!("  <dsl_command>  - Execute a DSL command");
-    println!("  help           - Show this help");
-    println!("  help commands  - Show detailed command syntax with diagrams");
-    println!("  help examples  - Show syntax examples");
-    println!("  variables      - Show current variables");
-    println!("  clear          - Clear all variables");
-    println!("  edit           - Open editor to compose DSL commands");
-    println!("  history        - Show command history");
-    println!("  clear-history  - Clear command history");
-    println!("  exit/quit      - Exit interactive mode");
-    println!();
-    println!("Keyboard Shortcuts:");
-    println!("  ↑/↓            - Navigate through command history");
-    println!("  Ctrl+R         - Search command history");
-    println!("  Ctrl+L         - Clear screen");
-    println!("  Ctrl+C         - Cancel current command");
-    println!("  Ctrl+D         - Exit (EOF)");
-    println!();
-    println!("DSL Command Examples:");
-    println!("  LIST CLUSTERS");
-    println!("  SET region = \"aws-us-west-1\"");
-    println!("  ECHO \"Hello, World!\"");
-    println!("  SLEEP 5");
-    println!();
-    println!("Multiple Commands:");
-    println!("  Use semicolons (;) to separate multiple commands:");
-    println!("  ECHO \"Hello\"; SET region = \"us-east-1\"; LIST CLUSTERS");
-    println!("  SLEEP 2; ECHO \"Done\"; WAIT FOR my-cluster TO BE Active");
-}
-
-fn show_variables(executor: &DSLExecutor) {
-    let variables = executor.get_variables();
-    if variables.is_empty() {
-        println!("No variables set");
-    } else {
-        println!("Current variables:");
-        for (name, value) in variables {
-            println!("  {name} = {value}");
-        }
-    }
-}
-
-async fn execute_edit_command(
-    executor: &mut DSLExecutor,
-    initial_command: Option<String>,
-    empty: bool,
-    editor: Option<&str>,
+fn execute_query_in_shell(
+    input: &str,
+    conn: &mut SQLiteConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use tracing::{debug, error, info};
+    let input = input.trim();
 
-    // Determine initial content for the editor
-    let initial_content = if empty {
-        String::new()
-    } else if let Some(cmd) = initial_command {
-        cmd
+    // Handle special SQLite-like commands
+    match input.to_lowercase().as_str() {
+        ".tables" => {
+            // Show available tables
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+            let mut rows = stmt.query([])?;
+
+            println!("{}", "Available tables:".green());
+            while let Some(row) = rows.next()? {
+                let table_name: String = row.get(0)?;
+                println!("  {table_name}");
+            }
+            return Ok(());
+        }
+        ".schema" => {
+            // Show schema for all tables
+            let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table'")?;
+            let mut rows = stmt.query([])?;
+
+            println!("{}", "Table schemas:".green());
+            while let Some(row) = rows.next()? {
+                let sql: String = row.get(0)?;
+                println!("{sql}");
+                println!();
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    // Check if it's a DELETE statement
+    if input.to_uppercase().starts_with("DELETE FROM") {
+        match parse_delete_statement(input) {
+            Ok((table_name, where_clause)) => {
+                println!("{}", "Parsed DELETE statement:".green());
+                println!("Table: {table_name}");
+                if let Some(where_clause) = where_clause {
+                    println!("WHERE: {where_clause}");
+                }
+
+                // For now, just show what would be sent to the API
+                println!(
+                    "{}",
+                    "Note: API calls not yet implemented in synchronous mode".yellow()
+                );
+
+                // Refresh data after operation
+                fetch_fresh_data_from_api(conn)?;
+            }
+            Err(e) => {
+                println!("{}: {}", "Error parsing DELETE statement".red(), e);
+            }
+        }
+        return Ok(());
+    }
+
+    // Execute as regular SQL query
+    let mut stmt = conn.prepare(input)?;
+    let column_count = stmt.column_count();
+
+    // Get column names first
+    let mut headers = Vec::new();
+    for i in 0..column_count {
+        headers.push(stmt.column_name(i).unwrap_or("unknown").to_string());
+    }
+
+    let mut rows = stmt.query([])?;
+
+    // Display results
+    println!("{}", "Query Results:".green());
+
+    // Print column headers
+    println!("| {}", headers.join(" | "));
+
+    // Print separator line
+    let separator: String = headers
+        .iter()
+        .map(|h| "-".repeat(h.len()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("| {separator}");
+
+    // Print data rows
+    let mut row_count = 0;
+    while let Some(row) = rows.next()? {
+        let values: Vec<String> = (0..column_count)
+            .map(|i| row.get::<_, String>(i).unwrap_or_default())
+            .collect();
+        println!("| {}", values.join(" | "));
+        row_count += 1;
+    }
+
+    if row_count > 0 {
+        println!("{}", format!("{row_count} row(s) returned").blue());
     } else {
-        // Default template
-        r#"# Edit your DSL command below
-# Examples:
-# ECHO "Hello, World!"
-# LIST CLUSTERS
-# SET region = "aws-us-west-1"
-# CREATE CLUSTER my-cluster IN aws-us-west-1 WITH min_rcu=1, max_rcu=10
-
-"#
-        .to_string()
-    };
-
-    info!("Opening editor for DSL command editing");
-    debug!("Initial content: {}", initial_content);
-
-    // Set editor if specified
-    if let Some(editor_name) = editor {
-        unsafe {
-            std::env::set_var("EDITOR", editor_name);
-        }
-        debug!("Using specified editor: {}", editor_name);
+        println!("{}", "No rows returned".yellow());
     }
-
-    // Open editor and get edited content
-    let edited_content = match edit(initial_content) {
-        Ok(content) => content,
-        Err(e) => {
-            error!("Failed to open editor: {}", e);
-            return Err(format!("Failed to open editor: {e}").into());
-        }
-    };
-
-    // Trim whitespace and check if content is empty
-    let trimmed_content = edited_content.trim();
-    if trimmed_content.is_empty() {
-        info!("No content provided, skipping execution");
-        println!("No content provided, skipping execution");
-        return Ok(());
-    }
-
-    // Remove comment lines and empty lines
-    let lines: Vec<&str> = trimmed_content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        })
-        .collect();
-
-    if lines.is_empty() {
-        info!("No valid commands found after filtering comments");
-        println!("No valid commands found after filtering comments");
-        return Ok(());
-    }
-
-    // Join lines and execute
-    let final_command = lines.join("\n");
-    info!("Executing edited command: {}", final_command);
-    println!("Executing command:");
-    println!("{final_command}");
-    println!();
-
-    // Execute the command
-    execute_single_command(executor, &final_command).await?;
 
     Ok(())
-}
-
-/// Get the history file path
-fn get_history_file_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home_dir = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-
-    let history_dir = home_dir.join(".tidb_dsl");
-    fs::create_dir_all(&history_dir)?;
-
-    Ok(history_dir.join("history.txt"))
-}
-
-/// Show command history
-fn show_history(rl: &DefaultEditor) {
-    println!("Command History:");
-    println!("================");
-
-    // Use a simple counter to show history entries
-    let mut count = 0;
-    for entry in rl.history().iter() {
-        count += 1;
-        println!("{count:3}: {entry}");
-    }
-
-    if count == 0 {
-        println!("No command history");
-    } else {
-        println!("Total: {count} commands");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ast_parsing_valid_sql() {
-        let result = UnifiedParser::parse("select displayName from cluster");
-        println!("AST Result: {result:?}");
-        assert!(
-            result.is_ok(),
-            "AST parsing should succeed for valid SQL syntax"
-        );
-    }
-
-    #[test]
-    fn test_ast_parsing_with_field_validation_deferred() {
-        let result = UnifiedParser::parse("select n from cluster");
-        println!("AST Result: {result:?}");
-        // The new AST-based architecture allows syntactically valid SQL to parse
-        // Field validation is deferred to execution time
-        assert!(
-            result.is_ok(),
-            "AST parsing should succeed for syntactically valid SQL"
-        );
-    }
-
-    #[test]
-    fn test_ast_parsing_echo_command() {
-        let result = UnifiedParser::parse("echo \"Hello World\"");
-        println!("AST Result: {result:?}");
-        assert!(
-            result.is_ok(),
-            "AST parsing should succeed for echo commands"
-        );
-    }
-
-    #[test]
-    fn test_ast_parsing_select_backups() {
-        let result = UnifiedParser::parse("SELECT * FROM BACKUPS");
-        println!("AST Result: {result:?}");
-        assert!(
-            result.is_ok(),
-            "AST parsing should succeed for SELECT queries"
-        );
-
-        // Verify it creates a Select AST node
-        let ast = result.unwrap();
-        match ast {
-            tidb_cli::dsl::ast::ASTNode::Query(tidb_cli::dsl::ast::QueryNode::Select {
-                ..
-            }) => {
-                // Success - it's a Select query
-            }
-            _ => panic!("Expected SELECT query to create a Select AST node"),
-        }
-    }
 }

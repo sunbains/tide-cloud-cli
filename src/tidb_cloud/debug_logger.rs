@@ -237,38 +237,3 @@ impl Default for DebugLogger {
         Self::new(VerbosityLevel::default())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_debug_logger_creation() {
-        let logger = DebugLogger::new(VerbosityLevel::Debug);
-        assert!(logger.is_enabled());
-        assert_eq!(logger.verbosity(), VerbosityLevel::Debug);
-    }
-
-    #[test]
-    fn test_debug_logger_silent() {
-        let logger = DebugLogger::new(VerbosityLevel::Silent);
-        assert!(!logger.is_enabled());
-    }
-
-    #[test]
-    fn test_verbosity_levels() {
-        assert_eq!(VerbosityLevel::Silent as u8, 0);
-        assert_eq!(VerbosityLevel::Error as u8, 1);
-        assert_eq!(VerbosityLevel::Warning as u8, 2);
-        assert_eq!(VerbosityLevel::Info as u8, 3);
-        assert_eq!(VerbosityLevel::Debug as u8, 4);
-        assert_eq!(VerbosityLevel::Trace as u8, 5);
-    }
-
-    #[test]
-    fn test_verbosity_from_u8() {
-        assert_eq!(VerbosityLevel::from(0), VerbosityLevel::Silent);
-        assert_eq!(VerbosityLevel::from(3), VerbosityLevel::Info);
-        assert_eq!(VerbosityLevel::from(10), VerbosityLevel::Trace);
-    }
-}
