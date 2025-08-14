@@ -203,12 +203,65 @@ impl DSLASTParser {
             ));
         }
 
+        if parts.len() < 6 {
+            return Err(DSLError::syntax_error(
+                0,
+                "WAIT FOR requires: cluster TO BE state".to_string(),
+            ));
+        }
+
         let state = parts[5].to_string();
+        let mut timeout = None;
+
+        // Parse optional WITH timeout clause
+        if parts.len() > 6 && parts[6].to_uppercase() == "WITH" {
+            if parts.len() < 8 {
+                return Err(DSLError::syntax_error(
+                    0,
+                    "WITH clause requires: timeout = value".to_string(),
+                ));
+            }
+
+            if parts[7].to_lowercase() != "timeout" {
+                return Err(DSLError::syntax_error(
+                    0,
+                    "WITH clause only supports 'timeout' option".to_string(),
+                ));
+            }
+
+            if parts.len() < 9 || parts[8] != "=" {
+                return Err(DSLError::syntax_error(
+                    0,
+                    "Expected '=' after 'timeout'".to_string(),
+                ));
+            }
+
+            if parts.len() < 10 {
+                return Err(DSLError::syntax_error(
+                    0,
+                    "Expected timeout value after '='".to_string(),
+                ));
+            }
+
+            // Parse timeout value
+            match parts[9].parse::<u64>() {
+                Ok(value) => timeout = Some(value),
+                Err(_) => {
+                    return Err(DSLError::syntax_error(
+                        0,
+                        format!(
+                            "Invalid timeout value: '{}'. Must be a positive integer.",
+                            parts[9]
+                        ),
+                    ));
+                }
+            }
+        }
 
         Ok(ASTNode::Command(CommandNode::WaitForCluster {
             name,
             state,
-            timeout: None, // Could parse optional timeout
+            timeout,
         }))
     }
 
@@ -876,5 +929,47 @@ mod tests {
         } else {
             panic!("Expected Sleep node");
         }
+    }
+
+    #[test]
+    fn test_parse_wait_for_cluster() {
+        let result = DSLASTParser::parse("WAIT FOR my-cluster TO BE active");
+        assert!(result.is_ok());
+        if let Ok(ASTNode::Command(CommandNode::WaitForCluster {
+            name,
+            state,
+            timeout,
+        })) = result
+        {
+            assert_eq!(name, "my-cluster");
+            assert_eq!(state, "active");
+            assert_eq!(timeout, None);
+        } else {
+            panic!("Expected WaitForCluster node");
+        }
+    }
+
+    #[test]
+    fn test_parse_wait_for_cluster_with_timeout() {
+        let result = DSLASTParser::parse("WAIT FOR my-cluster TO BE active WITH timeout = 300");
+        assert!(result.is_ok());
+        if let Ok(ASTNode::Command(CommandNode::WaitForCluster {
+            name,
+            state,
+            timeout,
+        })) = result
+        {
+            assert_eq!(name, "my-cluster");
+            assert_eq!(state, "active");
+            assert_eq!(timeout, Some(300));
+        } else {
+            panic!("Expected WaitForCluster node with timeout");
+        }
+    }
+
+    #[test]
+    fn test_parse_wait_for_cluster_invalid_syntax() {
+        let result = DSLASTParser::parse("WAIT FOR my-cluster active");
+        assert!(result.is_err());
     }
 }
