@@ -181,15 +181,67 @@ fn execute_sql_query(
     // Execute the query
     let mut stmt = conn.prepare(query)?;
     let column_count = stmt.column_count();
-    let mut rows = stmt.query([])?;
 
-    // Display results
-    println!("{}", "Query Results:".green());
+    // Get column names first
+    let mut headers = Vec::new();
+    for i in 0..column_count {
+        headers.push(stmt.column_name(i).unwrap_or("unknown").to_string());
+    }
+
+    let mut rows = stmt.query([])?;
+    let mut all_rows = Vec::new();
     while let Some(row) = rows.next()? {
         let values: Vec<String> = (0..column_count)
             .map(|i| row.get::<_, String>(i).unwrap_or_default())
             .collect();
-        println!("| {}", values.join(" | "));
+        all_rows.push(values);
+    }
+
+    // Calculate column widths for alignment
+    let mut col_widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
+    for row in &all_rows {
+        for (i, value) in row.iter().enumerate() {
+            if i < col_widths.len() {
+                col_widths[i] = col_widths[i].max(value.len());
+            }
+        }
+    }
+
+    // Display results
+    println!("{}", "Query Results:".green());
+    
+    // Print column headers with proper alignment
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("{:<width$}", h, width = col_widths[i]))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{}", header_line);
+
+    // Print separator line
+    let separator = col_widths
+        .iter()
+        .map(|&width| "-".repeat(width))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{}", separator);
+
+    // Print data rows with proper alignment
+    for row in &all_rows {
+        let row_line = row
+            .iter()
+            .enumerate()
+            .map(|(i, value)| format!("{:<width$}", value, width = col_widths.get(i).unwrap_or(&0)))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("{}", row_line);
+    }
+
+    if !all_rows.is_empty() {
+        println!("{}", format!("{} row(s) returned", all_rows.len()).blue());
+    } else {
+        println!("{}", "No rows returned".yellow());
     }
 
     Ok(())
@@ -538,33 +590,57 @@ fn execute_query_in_shell(
     }
 
     let mut rows = stmt.query([])?;
-
-    // Display results
-    println!("{}", "Query Results:".green());
-
-    // Print column headers
-    println!("| {}", headers.join(" | "));
-
-    // Print separator line
-    let separator: String = headers
-        .iter()
-        .map(|h| "-".repeat(h.len()))
-        .collect::<Vec<_>>()
-        .join(" | ");
-    println!("| {separator}");
-
-    // Print data rows
-    let mut row_count = 0;
+    let mut all_rows = Vec::new();
     while let Some(row) = rows.next()? {
         let values: Vec<String> = (0..column_count)
             .map(|i| row.get::<_, String>(i).unwrap_or_default())
             .collect();
-        println!("| {}", values.join(" | "));
-        row_count += 1;
+        all_rows.push(values);
     }
 
-    if row_count > 0 {
-        println!("{}", format!("{row_count} row(s) returned").blue());
+    // Calculate column widths for alignment
+    let mut col_widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
+    for row in &all_rows {
+        for (i, value) in row.iter().enumerate() {
+            if i < col_widths.len() {
+                col_widths[i] = col_widths[i].max(value.len());
+            }
+        }
+    }
+
+    // Display results
+    println!("{}", "Query Results:".green());
+
+    // Print column headers with proper alignment
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("{:<width$}", h, width = col_widths[i]))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{}", header_line);
+
+    // Print separator line
+    let separator = col_widths
+        .iter()
+        .map(|&width| "-".repeat(width))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("{}", separator);
+
+    // Print data rows with proper alignment
+    for row in &all_rows {
+        let row_line = row
+            .iter()
+            .enumerate()
+            .map(|(i, value)| format!("{:<width$}", value, width = col_widths.get(i).unwrap_or(&0)))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("{}", row_line);
+    }
+
+    if !all_rows.is_empty() {
+        println!("{}", format!("{} row(s) returned", all_rows.len()).blue());
     } else {
         println!("{}", "No rows returned".yellow());
     }
