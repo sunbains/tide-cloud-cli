@@ -1,16 +1,33 @@
 # TiDB Cloud CLI
 
-A command-line interface for managing TiDB Cloud resources using SQL syntax and SQLite integration. The CLI provides a virtual table interface that maps SQL operations to TiDB Cloud API calls.
+A command-line interface for managing TiDB Cloud resources using **SQLite Virtual Tables**. The CLI provides a seamless SQL interface that translates SQL operations directly into TiDB Cloud API calls in real-time.
 
 ## Features
 
-- **SQL Interface**: Full SQL support for querying and managing TiDB Cloud resources
-- **Virtual Tables**: SQLite tables that automatically sync with TiDB Cloud API
-- **Real-time Data**: Fresh data fetched from API on every query execution
-- **API Integration**: INSERT, UPDATE, DELETE operations trigger corresponding TiDB Cloud API calls
-- **Foreign Key Support**: Proper relationships between clusters, backups, and endpoints
-- **Local Caching**: SQLite integration for efficient data storage and querying
-- **Interactive Shell**: Full-featured SQL shell with command history
+- **SQLite Virtual Tables**: Native SQLite virtual table implementation with full SQL support
+- **Real-time API Integration**: Direct translation of SQL queries to TiDB Cloud API calls
+- **No Manual Parsing**: Leverages SQLite's built-in SQL engine for all operations
+- **Full CRUD Support**: INSERT, UPDATE, DELETE operations trigger real API calls
+- **Automatic Data Fetching**: Virtual tables fetch fresh data from API on-demand
+- **Interactive SQL Shell**: Full-featured SQL shell with command history and auto-completion
+- **Structured Logging**: Comprehensive debug logging for troubleshooting
+
+## Architecture
+
+The TiDB Cloud CLI uses **SQLite Virtual Tables** that implement the `rusqlite::vtab` traits:
+
+- **`VTab`**: Defines table schema and handles table-level operations
+- **`VTabCursor`**: Manages data iteration and API calls
+- **`CreateVTab`**: Handles INSERT operations (creates real TiDB Cloud resources)
+- **`UpdateVTab`**: Handles UPDATE operations (modifies existing resources)
+- **`DeleteVTab`**: Handles DELETE operations (removes resources)
+
+### How It Works
+
+1. **SQL Query Execution**: User executes SQL against virtual tables
+2. **Virtual Table Handlers**: SQLite calls appropriate virtual table methods
+3. **API Translation**: Virtual tables translate operations to TiDB Cloud API calls
+4. **Real-time Results**: Fresh data returned directly from API responses
 
 ## Installation
 
@@ -28,117 +45,175 @@ Start the interactive shell to execute SQL queries directly:
 tidb-cli --username your-username --password your-api-key --base-url https://cloud.dev.tidbapi.com/v1beta2 shell
 ```
 
-Once in the shell, you can:
-- Type `help` to see available tables and example queries
-- Use `.tables` to list all tables
-- Use `.schema <table_name>` to see table structure
-- Execute any SQL query directly
+### Available Virtual Tables
 
-### Available Tables
+#### 1. `tidb_clusters`
+**Schema**: Full TiDB cluster information
+```sql
+CREATE TABLE tidb_clusters (
+    tidb_id TEXT,           -- Primary identifier
+    name TEXT,              -- Resource name
+    display_name TEXT,      -- Human-readable name
+    region_id TEXT,         -- Cloud region
+    state TEXT,             -- Cluster state
+    create_time TEXT,       -- Creation timestamp
+    root_password TEXT,     -- Root password
+    min_rcu TEXT,          -- Minimum RCU
+    max_rcu TEXT,          -- Maximum RCU
+    service_plan TEXT,      -- Service tier
+    cloud_provider TEXT,    -- Cloud provider
+    region_display_name TEXT, -- Region description
+    raw_data TEXT           -- Full JSON response
+);
+```
 
-The CLI provides the following virtual tables that automatically sync with TiDB Cloud:
+**Supported Operations**:
+- ✅ **SELECT**: Query clusters with WHERE, JOIN, GROUP BY, ORDER BY
+- ✅ **INSERT**: Create new clusters (triggers `create_tidb` API)
+- ✅ **UPDATE**: Modify cluster properties (triggers `update_tidb` API)
+- ✅ **DELETE**: Remove clusters (triggers `delete_tidb` API)
 
-#### 1. clusters
-Contains TiDB cluster information with fields:
-- `tidb_id`, `name`, `display_name`, `state`, `region_id`
-- `root_password`, `min_rcu`, `max_rcu`, `service_plan`
-- `cloud_provider`, `region_display_name`, `raw_data`
+#### 2. `tidb_backups`
+**Schema**: Backup information for clusters
+```sql
+CREATE TABLE tidb_backups (
+    backup_id TEXT,         -- Primary identifier
+    tidb_id TEXT,          -- Foreign key to clusters
+    backup_name TEXT,       -- Backup name
+    description TEXT,       -- Backup description
+    status TEXT,            -- Backup status
+    size_bytes TEXT,        -- Size in bytes
+    raw_data TEXT           -- Full JSON response
+);
+```
 
-#### 2. backups
-Contains backup information with fields:
-- `backup_id`, `tidb_id`, `backup_name`, `status`, `size_bytes`, `raw_data`
+**Supported Operations**:
+- ✅ **SELECT**: Query backups with constraints
+- ✅ **INSERT**: Create new backups (triggers `create_backup` API)
+- ✅ **UPDATE**: Modify backup description (triggers `update_backup` API)
+- ✅ **DELETE**: Remove backups (triggers `delete_backup` API)
 
-#### 3. public_endpoints
-Contains TiDB cluster endpoint information with fields:
-- `endpoint_id`, `tidb_id`, `host`, `port`, `connection_type`, `raw_data`
-- Linked to clusters table via foreign key (`tidb_id`)
+#### 3. `tidb_public_endpoints`
+**Schema**: Public endpoint information extracted from clusters
+```sql
+CREATE TABLE tidb_public_endpoints (
+    endpoint_id TEXT,       -- Endpoint identifier
+    tidb_id TEXT,          -- Foreign key to clusters
+    host TEXT,              -- Host address
+    port TEXT,              -- Port number
+    connection_type TEXT,   -- Connection type
+    raw_data TEXT           -- Full JSON response
+);
+```
 
-#### 4. config
-Contains configuration information with fields:
-- `key`, `value`, `raw_data`
+**Supported Operations**:
+- ✅ **SELECT**: Query endpoints (read-only)
+- 🔒 **INSERT/UPDATE/DELETE**: Not supported (endpoints managed via clusters)
 
 ### Example Queries
 
-#### Basic Queries
+#### Basic Cluster Operations
 ```sql
 -- List all active clusters
-SELECT * FROM clusters WHERE state = 'ACTIVE';
+SELECT * FROM tidb_clusters WHERE state = 'ACTIVE';
 
 -- Get cluster details with region information
-SELECT display_name, region_id FROM clusters ORDER BY create_time DESC;
+SELECT display_name, region_id, min_rcu, max_rcu 
+FROM tidb_clusters 
+ORDER BY create_time DESC;
 
--- Count backups per cluster
-SELECT c.display_name, COUNT(b.backup_id) 
-FROM clusters c 
-LEFT JOIN backups b ON c.tidb_id = b.tidb_id 
-GROUP BY c.tidb_id;
+-- Count clusters by service plan
+SELECT service_plan, COUNT(*) as cluster_count 
+FROM tidb_clusters 
+GROUP BY service_plan 
+ORDER BY cluster_count DESC;
 ```
 
-#### Endpoint Queries
+#### Backup Management
+```sql
+-- List all backups with cluster information
+SELECT c.display_name, b.backup_name, b.status, b.size_bytes
+FROM tidb_clusters c
+JOIN tidb_backups b ON c.tidb_id = b.tidb_id
+WHERE b.status = 'COMPLETED';
+
+-- Count backups per cluster
+SELECT c.display_name, COUNT(b.backup_id) as backup_count
+FROM tidb_clusters c
+LEFT JOIN tidb_backups b ON c.tidb_id = b.tidb_id
+GROUP BY c.tidb_id, c.display_name;
+```
+
+#### Endpoint Information
 ```sql
 -- List all public endpoints
-SELECT * FROM public_endpoints WHERE connection_type = 'PUBLIC';
+SELECT * FROM tidb_public_endpoints WHERE connection_type = 'PUBLIC';
 
 -- Join clusters with their endpoints
-SELECT c.display_name, pe.host, pe.port 
-FROM clusters c 
-JOIN public_endpoints pe ON c.tidb_id = pe.tidb_id;
+SELECT c.display_name, pe.host, pe.port, pe.connection_type
+FROM tidb_clusters c
+JOIN tidb_public_endpoints pe ON c.tidb_id = pe.tidb_id;
 ```
 
 ### Data Modification Operations
 
 #### Creating Clusters
 ```sql
-INSERT INTO clusters (tidb_id, name, display_name, region_id, state, create_time, root_password, min_rcu, max_rcu, service_plan, cloud_provider, region_display_name, raw_data)
-VALUES (NULL, 'clusters/new-cluster', 'My New Cluster', 'aws-us-east-1', 'CREATING', NOW(), '5000', '10000', 'Premium', 'aws', 'Virginia (us-east-1)', '{}');
+INSERT INTO tidb_clusters (
+    display_name, region_id, min_rcu, max_rcu, 
+    service_plan, cloud_provider
+) VALUES (
+    'My New Cluster', 'aws-us-east-1', '1000', '2000', 
+    'Basic', 'aws'
+);
 ```
+
+**Required Fields**: `display_name`, `region_id`
+**Optional Fields**: `min_rcu`, `max_rcu`, `service_plan`, `cloud_provider`
+**Defaults**: `min_rcu=1000`, `max_rcu=2000`, `service_plan='Basic'`, `cloud_provider='aws'`
 
 #### Creating Backups
 ```sql
--- Direct cluster ID
-INSERT INTO backups (tidb_id, description) VALUES ('cluster-123', 'Manual backup for testing');
+-- Create backup for specific cluster
+INSERT INTO tidb_backups (tidb_id, description) 
+VALUES ('cluster-123', 'Manual backup for testing');
 
--- Using subquery to find cluster by display name
-INSERT INTO backups (tidb_id, description) 
-VALUES ((SELECT tidb_id FROM clusters WHERE display_name = 'My Cluster'), 'Backup by display name');
-
--- Using subquery to find cluster by name
-INSERT INTO backups (tidb_id, description) 
-VALUES ((SELECT tidb_id FROM clusters WHERE name = 'clusters/test-cluster'), 'Backup by cluster name');
-```
-
-#### Deleting Backups
-```sql
--- Delete specific backup
-DELETE FROM backups WHERE backup_id = 'backup-123';
-
--- Delete all backups for a cluster
-DELETE FROM backups WHERE tidb_id = 'cluster-456';
+-- Create backup using subquery to find cluster
+INSERT INTO tidb_backups (tidb_id, description) 
+VALUES (
+    (SELECT tidb_id FROM tidb_clusters WHERE display_name = 'My Cluster'), 
+    'Backup by display name'
+);
 ```
 
 #### Updating Clusters
 ```sql
 -- Update cluster configuration
-UPDATE clusters 
+UPDATE tidb_clusters 
 SET display_name = 'New Name', min_rcu = '6000', max_rcu = '12000' 
 WHERE tidb_id = 'cluster-123';
 
 -- Update only display name
-UPDATE clusters 
+UPDATE tidb_clusters 
 SET display_name = 'Updated Name' 
 WHERE tidb_id = 'cluster-456';
 
 -- Update root password (triggers separate API call)
-UPDATE clusters 
+UPDATE tidb_clusters 
 SET root_password = 'new-password-123' 
 WHERE tidb_id = 'cluster-789';
 ```
 
-#### Managing Endpoints
+#### Deleting Resources
 ```sql
--- Create new endpoint (triggers API call to update public connection settings)
-INSERT INTO public_endpoints (endpoint_id, tidb_id, host, port, connection_type, raw_data) 
-VALUES ('endpoint-1', 'cluster-123', '192.168.1.100', '4000', 'PUBLIC', '{}');
+-- Delete specific cluster
+DELETE FROM tidb_clusters WHERE tidb_id = 'cluster-123';
+
+-- Delete specific backup
+DELETE FROM tidb_backups WHERE backup_id = 'backup-456';
+
+-- Delete all backups for a cluster
+DELETE FROM tidb_backups WHERE tidb_id = 'cluster-123';
 ```
 
 ## Command Line Parameters
@@ -146,7 +221,7 @@ VALUES ('endpoint-1', 'cluster-123', '192.168.1.100', '4000', 'PUBLIC', '{}');
 ### Global Options
 
 ```bash
-# Authentication
+# Authentication (Required)
 --username, -u <USERNAME>           # TiDB Cloud username
 --password, -p <PASSWORD>           # TiDB Cloud password/API key
 --base-url <URL>                    # TiDB Cloud API base URL
@@ -156,9 +231,6 @@ VALUES ('endpoint-1', 'cluster-123', '192.168.1.100', '4000', 'PUBLIC', '{}');
 --log-level <LEVEL>                 # Log level (trace, debug, info, warn, error)
 --log-file                          # Enable file logging
 --log-file-path <PATH>              # Log file path
-
-# Operation Settings
---timeout, -t <SECONDS>             # Timeout in seconds (default: 300)
 ```
 
 ### Commands
@@ -176,9 +248,6 @@ script <FILE>                       # Execute SQL script from a file
 # Show available tables and schemas
 show-tables                         # List all available virtual tables
 examples                            # Show SQL query examples
-
-# Setup and configuration
-setup                               # Initialize virtual tables
 ```
 
 ### Examples
@@ -186,42 +255,53 @@ setup                               # Initialize virtual tables
 ```bash
 # Start interactive SQL shell
 tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tbapi.com/v1beta2 shell
+         --base-url https://cloud.dev.tidbapi.com/v1beta2 shell
 
 # Execute single SQL query
 tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tbapi.com/v1beta2 \
-         query "SELECT * FROM clusters WHERE state = 'ACTIVE'"
+         --base-url https://cloud.dev.tidbapi.com/v1beta2 \
+         query "SELECT * FROM tidb_clusters WHERE state = 'ACTIVE'"
 
 # Verbose logging with debug level
 tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tbapi.com/v1beta2 \
+         --base-url https://cloud.dev.tidbapi.com/v1beta2 \
          --verbose \
          --log-level debug \
          shell
-
-# Execute SQL script from file
-tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tbapi.com/v1beta2 \
-         script ./queries.sql
-
-# Show available tables
-tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tbapi.com/v1beta2 \
-         show-tables
 ```
 
-## Configuration
+## Virtual Table Implementation Details
 
-The CLI requires TiDB Cloud authentication via command line parameters or environment variables:
+### Architecture Components
 
-```bash
-# Required environment variables (alternative to command line)
-export TIDB_CLOUD_USERNAME="your-username"
-export TIDB_CLOUD_PASSWORD="your-api-key"
-export TIDB_CLOUD_API_KEY="your-api-key"  # Backward compatibility
-```
+- **`TidbClustersTab`**: Implements `VTab`, `CreateVTab`, `UpdateVTab`, `DeleteVTab`
+- **`TidbClustersCursor`**: Implements `VTabCursor` for data iteration
+- **`TidbBackupsTab`**: Similar implementation for backup operations
+- **`TidbPublicEndpointsTab`**: Read-only virtual table for endpoint data
 
+### Key Methods
+
+- **`connect()`**: Defines table schema
+- **`best_index()`**: Optimizes query execution based on constraints
+- **`filter()`**: Fetches data from API based on SQL constraints
+- **`insert()`**: Creates resources via TiDB Cloud API
+- **`update()`**: Modifies resources via TiDB Cloud API
+- **`delete()`**: Removes resources via TiDB Cloud API
+
+### Constraint Optimization
+
+The virtual tables automatically optimize queries by:
+- Analyzing WHERE clause constraints
+- Applying filters at the API level when possible
+- Using constraint masks for efficient query planning
+- Estimating query costs for SQLite's query planner
+
+### Error Handling
+
+- **API Failures**: Hard errors (no fallback to sample data)
+- **Authentication Errors**: Proper error propagation
+- **Network Issues**: Clear error messages with context
+- **Validation**: Input validation before API calls
 
 ## Development
 
@@ -233,43 +313,11 @@ cargo build
 cargo test
 
 # Run CLI
-cargo run
+cargo run --bin tidb-cli -- shell
+
+# Check for warnings
+cargo clippy
 ```
-
-## Architecture
-
-The TiDB Cloud CLI uses a **SQLite-based architecture** that provides a seamless SQL interface to TiDB Cloud data:
-
-- **SQLite Integration**: Uses SQLite as the query engine with local tables for data caching
-- **API Synchronization**: Automatically fetches fresh data from TiDB Cloud API before executing queries
-- **Materialized Views**: The `public_endpoints` table is implemented as a materialized view that automatically extracts endpoint data from cluster JSON
-- **Direct SQL Execution**: All SQL statements are passed directly to SQLite without Rust-side parsing
-- **SQLite Triggers**: Uses SQLite triggers to handle INSERT/UPDATE/DELETE operations (currently logging only)
-- **Real-time Data**: Queries always run against the latest data from the TiDB Cloud API
-
-## API Integration Features
-
-### Current Implementation
-The CLI currently provides a SQL interface to TiDB Cloud data with the following capabilities:
-
-- **Data Querying**: All SELECT queries are executed against fresh data from the TiDB Cloud API
-- **Data Storage**: Local SQLite tables cache the latest data from the API
-- **Materialized Views**: The `public_endpoints` view automatically extracts endpoint information from cluster JSON data
-- **SQLite Triggers**: Basic triggers are in place for INSERT/UPDATE/DELETE operations (currently logging only)
-
-### Future Enhancements
-The architecture is designed to support full API integration through SQLite triggers:
-
-- **INSERT INTO clusters**: Will create new TiDB clusters via `create_tidb` API
-- **INSERT INTO backups**: Will create new backups via `create_backup` API  
-- **DELETE FROM clusters**: Will remove clusters via `delete_tidb` API
-- **DELETE FROM backups**: Will remove backups via `delete_backup` API
-- **UPDATE clusters**: Will update cluster configuration via `update_tidb` API
-
-### Data Synchronization
-- All data is fetched fresh from the TiDB Cloud API on every query execution
-- Local SQLite tables are automatically populated and synchronized
-- The materialized view automatically reflects changes in the underlying cluster data
 
 ## License
 
