@@ -55,14 +55,13 @@ pub struct BackupData {
     pub raw_data: String,
 }
 
-/// Public endpoint data for virtual table
+/// Network access data for virtual table
 #[derive(Clone)]
-pub struct PublicEndpointData {
-    pub endpoint_id: String, // host:port
+pub struct NetworkAccessData {
     pub tidb_id: String,
-    pub host: String,
-    pub port: String,
-    pub connection_type: String,
+    pub enabled: String,
+    pub cidr_notation: String,
+    pub description: String,
     pub raw_data: String,
 }
 
@@ -390,11 +389,11 @@ pub fn delete_backup(tidb_id: &str, backup_id: &str) -> Result<(), String> {
 }
 
 // ============================================================================
-// Public Endpoints Management Operations
+// Network Access Management Operations
 // ============================================================================
 
-/// Fetch public endpoints from TiDB Cloud API (sync wrapper)
-pub fn fetch_public_endpoints() -> Result<Vec<PublicEndpointData>, String> {
+/// Fetch network access settings from TiDB Cloud API (sync wrapper)
+pub fn fetch_network_access() -> Result<Vec<NetworkAccessData>, String> {
     let runtime = RUNTIME.get().ok_or("Runtime not initialized")?;
 
     let client = CLIENT.get().ok_or("Client not initialized")?;
@@ -404,44 +403,260 @@ pub fn fetch_public_endpoints() -> Result<Vec<PublicEndpointData>, String> {
             let client_guard = client.lock().unwrap();
             client_guard.clone()
         };
-        client_clone.list_all_tidbs(None).await
-    });
 
-    match result {
-        Ok(tidbs) => {
-            let mut public_endpoints = Vec::new();
+        // First get all clusters, then get network access settings for each
+        let tidbs = client_clone.list_all_tidbs(None).await?;
+        let mut all_network_access = Vec::new();
 
-            for tidb in tidbs {
-                if let (Some(tidb_id), Some(endpoints)) =
-                    (tidb.tidb_id.clone(), tidb.endpoints.clone())
-                {
-                    for endpoint in endpoints {
-                        // Only include public endpoints
-                        if let (Some(host), Some(port), Some(connection_type)) = (
-                            endpoint.host.clone(),
-                            endpoint.port,
-                            endpoint.connection_type.clone(),
-                        ) && connection_type
-                            == crate::tidb_cloud::models::EndpointConnectionType::Public
-                        {
-                            let endpoint_id = format!("{host}:{port}");
-                            let raw_data = serde_json::to_string(&endpoint).unwrap_or_default();
+        for tidb in tidbs {
+            if let Some(tidb_id) = tidb.tidb_id {
+                match client_clone.get_public_connection(&tidb_id).await {
+                    Ok(connection) => {
+                        let raw_data = serde_json::to_string(&connection).unwrap_or_default();
 
-                            public_endpoints.push(PublicEndpointData {
-                                endpoint_id,
-                                tidb_id: tidb_id.clone(),
-                                host,
-                                port: port.to_string(),
-                                connection_type: format!("{connection_type:?}"),
+                        // Create a row for each IP access entry, or one row if no entries
+                        if connection.ip_access_list.is_empty() {
+                            let network_data = NetworkAccessData {
+                                tidb_id: connection.tidb_id,
+                                enabled: connection.enabled.to_string(),
+                                cidr_notation: String::new(),
+                                description: String::new(),
                                 raw_data,
-                            });
+                            };
+                            all_network_access.push(network_data);
+                        } else {
+                            for entry in connection.ip_access_list {
+                                let network_data = NetworkAccessData {
+                                    tidb_id: connection.tidb_id.clone(),
+                                    enabled: connection.enabled.to_string(),
+                                    cidr_notation: entry.cidr_notation,
+                                    description: entry.description,
+                                    raw_data: raw_data.clone(),
+                                };
+                                all_network_access.push(network_data);
+                            }
                         }
+                    }
+                    Err(_e) => {
+                        // Continue if we can't get network access for this cluster
+                        // This could happen if the cluster doesn't support network access or isn't ready yet
                     }
                 }
             }
-
-            Ok(public_endpoints)
         }
+
+        Ok::<Vec<NetworkAccessData>, crate::tidb_cloud::error::TiDBCloudError>(all_network_access)
+    });
+
+    match result {
+        Ok(network_access) => Ok(network_access),
         Err(e) => Err(format!("API error: {e}")),
+    }
+}
+
+/// Add IP to access list (sync wrapper)
+pub fn add_ip_to_access_list(
+    tidb_id: &str,
+    cidr_notation: &str,
+    description: &str,
+    enabled: Option<bool>,
+) -> Result<(), String> {
+    let runtime = RUNTIME.get().ok_or("Runtime not initialized")?;
+
+    let client = CLIENT.get().ok_or("Client not initialized")?;
+
+    let enabled_val = enabled.unwrap_or(true);
+
+    let result = runtime.block_on(async {
+        let mut client_clone = {
+            let client_guard = client.lock().unwrap();
+            client_guard.clone()
+        };
+
+        // Get current settings first
+        let current_settings = client_clone.get_public_connection(tidb_id).await?;
+
+        // Create new IP access list
+        let mut ip_access_list = current_settings.ip_access_list;
+
+        // Add new entry
+        use crate::tidb_cloud::models::IpAccessListEntry;
+        ip_access_list.push(IpAccessListEntry {
+            cidr_notation: cidr_notation.to_string(),
+            description: description.to_string(),
+        });
+
+        let update_request = crate::tidb_cloud::models::UpdatePublicConnectionRequest {
+            enabled: enabled_val,
+            ip_access_list,
+        };
+
+        client_clone
+            .update_public_connection(tidb_id, &update_request)
+            .await
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to add IP to access list: {e}")),
+    }
+}
+
+/// Remove IP from access list (sync wrapper)
+pub fn remove_ip_from_access_list(tidb_id: &str, cidr_notation: &str) -> Result<(), String> {
+    let runtime = RUNTIME.get().ok_or("Runtime not initialized")?;
+
+    let client = CLIENT.get().ok_or("Client not initialized")?;
+
+    let result = runtime.block_on(async {
+        let mut client_clone = {
+            let client_guard = client.lock().unwrap();
+            client_guard.clone()
+        };
+
+        // Get current settings first
+        let current_settings = client_clone.get_public_connection(tidb_id).await?;
+
+        // Remove the specified entry from IP access list
+        let ip_access_list = current_settings
+            .ip_access_list
+            .into_iter()
+            .filter(|entry| entry.cidr_notation != cidr_notation)
+            .collect();
+
+        let update_request = crate::tidb_cloud::models::UpdatePublicConnectionRequest {
+            enabled: current_settings.enabled,
+            ip_access_list,
+        };
+
+        client_clone
+            .update_public_connection(tidb_id, &update_request)
+            .await
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to remove IP from access list: {e}")),
+    }
+}
+
+/// Update a specific access list entry (sync wrapper)
+pub fn update_access_list_entry(
+    tidb_id: &str,
+    cidr_notation: &str,
+    new_description: Option<&str>,
+    new_enabled: Option<bool>,
+) -> Result<(), String> {
+    let runtime = RUNTIME.get().ok_or("Runtime not initialized")?;
+
+    let client = CLIENT.get().ok_or("Client not initialized")?;
+
+    let result = runtime.block_on(async {
+        let mut client_clone = {
+            let client_guard = client.lock().unwrap();
+            client_guard.clone()
+        };
+
+        // Get current settings first
+        let current_settings = client_clone.get_public_connection(tidb_id).await?;
+
+        // Update the specified entry in IP access list
+        let ip_access_list = current_settings
+            .ip_access_list
+            .into_iter()
+            .map(|mut entry| {
+                if entry.cidr_notation == cidr_notation
+                    && let Some(desc) = new_description
+                {
+                    entry.description = desc.to_string();
+                }
+                // Note: enabled is a global setting, not per-entry, but we can update the global setting
+                entry
+            })
+            .collect();
+
+        let enabled_val = new_enabled.unwrap_or(current_settings.enabled);
+
+        let update_request = crate::tidb_cloud::models::UpdatePublicConnectionRequest {
+            enabled: enabled_val,
+            ip_access_list,
+        };
+
+        client_clone
+            .update_public_connection(tidb_id, &update_request)
+            .await
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to update access list entry: {e}")),
+    }
+}
+
+/// Update network access settings (sync wrapper)
+pub fn update_network_access(
+    tidb_id: &str,
+    enabled: &str,
+    cidr_notation: &str,
+    description: &str,
+) -> Result<(), String> {
+    let runtime = RUNTIME.get().ok_or("Runtime not initialized")?;
+
+    let client = CLIENT.get().ok_or("Client not initialized")?;
+
+    // Parse enabled string to boolean
+    let enabled_bool = match enabled.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        _ => return Err(format!("Invalid enabled value: {enabled}. Use true/false")),
+    };
+
+    let result = runtime.block_on(async {
+        let mut client_clone = {
+            let client_guard = client.lock().unwrap();
+            client_guard.clone()
+        };
+
+        // Get current settings first
+        let current_settings = client_clone.get_public_connection(tidb_id).await?;
+
+        // Create new IP access list
+        let mut ip_access_list = current_settings.ip_access_list;
+
+        // If we have new CIDR and description, update or add the entry
+        if !cidr_notation.is_empty() {
+            // Check if this CIDR already exists and update it
+            let mut found = false;
+            for entry in &mut ip_access_list {
+                if entry.cidr_notation == cidr_notation {
+                    entry.description = description.to_string();
+                    found = true;
+                    break;
+                }
+            }
+
+            // If not found, add new entry
+            if !found {
+                use crate::tidb_cloud::models::IpAccessListEntry;
+                ip_access_list.push(IpAccessListEntry {
+                    cidr_notation: cidr_notation.to_string(),
+                    description: description.to_string(),
+                });
+            }
+        }
+
+        let update_request = crate::tidb_cloud::models::UpdatePublicConnectionRequest {
+            enabled: enabled_bool,
+            ip_access_list,
+        };
+
+        client_clone
+            .update_public_connection(tidb_id, &update_request)
+            .await
+    });
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to update network access: {e}")),
     }
 }

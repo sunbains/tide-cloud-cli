@@ -1,16 +1,20 @@
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use colored::*;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::env;
 use std::path::PathBuf;
+use std::time::Instant;
 use tracing::Level;
 
 use tidb_cli::{
     logging::{LogConfig, init_logging},
-    sqlite::{SQLiteConnection, register_module},
+    sqlite::{SQLiteConnection, register_module, vtable},
     tidb_cloud::TiDBCloudClient,
 };
+
+/// Type alias for query results: (headers, rows)
+type QueryResult = (Vec<String>, Vec<Vec<String>>);
 
 #[derive(Parser)]
 #[command(name = "tidb-cli")]
@@ -44,40 +48,11 @@ struct Cli {
     /// Log file path
     #[arg(long)]
     log_file_path: Option<String>,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Execute a SQL query
-    Query {
-        /// SQL query to execute
-        query: String,
-    },
-    /// Execute a SQL script from file
-    Script {
-        /// Path to SQL script file
-        file: String,
-    },
-    /// Setup virtual tables
-    Setup {
-        /// Setup virtual tables
-        tables: bool,
-    },
-    /// Show available virtual tables
-    ShowTables,
-    /// Show example queries
-    Examples,
-    /// Start interactive SQL shell
-    Shell,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Initialize logging
     let level = match cli.log_level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
         "debug" => Level::DEBUG,
@@ -98,36 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_logging(&log_config)?;
 
-    // Create TiDB Cloud client
     let client = create_tidb_client(&cli)?;
 
-    // Handle commands
-    match cli.command {
-        Some(Commands::Query { query }) => {
-            execute_sql_query(&query, &client)?;
-        }
-        Some(Commands::Script { file }) => {
-            execute_sql_script(&file, &client)?;
-        }
-        Some(Commands::Setup { tables }) => {
-            if tables {
-                setup_virtual_tables(&client)?;
-            }
-        }
-        Some(Commands::ShowTables) => {
-            show_virtual_tables()?;
-        }
-        Some(Commands::Examples) => {
-            show_examples();
-        }
-        Some(Commands::Shell) => {
-            interactive_shell(&client)?;
-        }
-        None => {
-            // Default to interactive shell
-            interactive_shell(&client)?;
-        }
-    }
+    interactive_shell(&client)?;
 
     Ok(())
 }
@@ -163,164 +111,11 @@ fn create_tidb_client(cli: &Cli) -> Result<TiDBCloudClient, Box<dyn std::error::
     Ok(client)
 }
 
-fn execute_sql_query(
-    query: &str,
-    client: &TiDBCloudClient,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Executing SQL query:".green());
-    println!("{query}");
-    println!();
-
-    // Create SQLite connection with virtual tables
-    let mut conn = SQLiteConnection::new_in_memory()?;
-    register_module(&conn, client)?;
-
-    // Create virtual tables
-    setup_virtual_tables_in_connection(&mut conn)?;
-
-    // Execute the query
-    let mut stmt = conn.prepare(query)?;
-    let column_count = stmt.column_count();
-
-    // Get column names first
-    let mut headers = Vec::new();
-    for i in 0..column_count {
-        headers.push(stmt.column_name(i).unwrap_or("unknown").to_string());
-    }
-
-    let mut rows = stmt.query([])?;
-    let mut all_rows = Vec::new();
-    while let Some(row) = rows.next()? {
-        let values: Vec<String> = (0..column_count)
-            .map(|i| row.get::<_, String>(i).unwrap_or_default())
-            .collect();
-        all_rows.push(values);
-    }
-
-    // Calculate column widths for alignment
-    let mut col_widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
-    for row in &all_rows {
-        for (i, value) in row.iter().enumerate() {
-            if i < col_widths.len() {
-                col_widths[i] = col_widths[i].max(value.len());
-            }
-        }
-    }
-
-    // Display results
-    println!("{}", "Query Results:".green());
-    
-    // Print column headers with proper alignment
-    let header_line = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| format!("{:<width$}", h, width = col_widths[i]))
-        .collect::<Vec<_>>()
-        .join("  ");
-    println!("{}", header_line);
-
-    // Print separator line
-    let separator = col_widths
-        .iter()
-        .map(|&width| "-".repeat(width))
-        .collect::<Vec<_>>()
-        .join("  ");
-    println!("{}", separator);
-
-    // Print data rows with proper alignment
-    for row in &all_rows {
-        let row_line = row
-            .iter()
-            .enumerate()
-            .map(|(i, value)| format!("{:<width$}", value, width = col_widths.get(i).unwrap_or(&0)))
-            .collect::<Vec<_>>()
-            .join("  ");
-        println!("{}", row_line);
-    }
-
-    if !all_rows.is_empty() {
-        println!("{}", format!("{} row(s) returned", all_rows.len()).blue());
-    } else {
-        println!("{}", "No rows returned".yellow());
-    }
-
-    Ok(())
-}
-
-fn execute_sql_script(
-    file_path: &str,
-    client: &TiDBCloudClient,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(file_path)?;
-    println!("{}", format!("Executing SQL script: {file_path}").green());
-
-    // Create SQLite connection with virtual tables
-    let mut conn = SQLiteConnection::new_in_memory()?;
-    register_module(&conn, client)?;
-
-    // Create virtual tables
-    setup_virtual_tables_in_connection(&mut conn)?;
-
-    // Execute the script
-    conn.execute_batch(&content)?;
-
-    println!("{}", "Script executed successfully!".green());
-    Ok(())
-}
-
-fn setup_virtual_tables(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Setting up virtual tables...".green());
-
-    // Create SQLite connection
-    let mut conn = SQLiteConnection::new_in_memory()?;
-    register_module(&conn, client)?;
-
-    // Create virtual tables
-    setup_virtual_tables_in_connection(&mut conn)?;
-
-    println!("{}", "Virtual tables created successfully!".green());
-    println!("You can now run SQL queries against TiDB Cloud data.");
-
-    Ok(())
-}
-
-/// Parse DELETE statement to extract table name and WHERE clause
-fn parse_delete_statement(
-    input: &str,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    let input = input.trim().to_uppercase();
-
-    // Find the table name after DELETE FROM
-    if let Some(from_pos) = input.find("FROM") {
-        let after_from = &input[from_pos + 4..];
-        let parts: Vec<&str> = after_from.split_whitespace().collect();
-
-        if parts.is_empty() {
-            return Err("No table name found after FROM".into());
-        }
-
-        let table_name = parts[0].to_lowercase();
-
-        // Check if there's a WHERE clause
-        if let Some(where_pos) = after_from.find("WHERE") {
-            let where_clause = after_from[where_pos + 6..].trim();
-            Ok((table_name, Some(where_clause.to_string())))
-        } else {
-            Ok((table_name, None))
-        }
-    } else {
-        Err("No FROM clause found in DELETE statement".into())
-    }
-}
-
-/// Fetch fresh data from TiDB Cloud API and populate SQLite tables
 fn fetch_fresh_data_from_api(
     conn: &mut SQLiteConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Fetching fresh data from TiDB Cloud API...");
 
-    // Note: We're now using virtual tables, so no need to manually populate data
-    // The virtual tables will handle data fetching on-demand
     println!("Note: Using virtual tables for on-demand data access");
 
     // Create a simple config table for status
@@ -333,18 +128,110 @@ fn fetch_fresh_data_from_api(
         );
         INSERT OR REPLACE INTO config (key, value, raw_data) VALUES 
         ('api_status', 'virtual_table_mode', '{"mode": "vtab", "note": "Using virtual tables for data access"}');
+
+        -- SQLite doesn't support stored procedures, functionality moved to application layer
         "#,
     )?;
 
+    // Register custom SQLite function for check_if_cluster_is_active
+    conn.create_scalar_function(
+        "check_if_cluster_is_active",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let display_name: String = ctx.get(0)?;
+
+            // Get a mutable connection - this is tricky within a function
+            // For now, we'll use a simpler approach with a direct query
+            let conn_ptr = unsafe { ctx.get_connection()? };
+
+            // Execute the query directly
+            let mut stmt =
+                conn_ptr.prepare("SELECT state FROM tidb_clusters WHERE display_name = ?1")?;
+            let mut rows = stmt.query([&display_name])?;
+
+            if let Some(row) = rows.next()? {
+                let state: String = row.get(0)?;
+                if state.to_lowercase() == "active" {
+                    return Ok("ACTIVE".to_string());
+                } else {
+                    return Ok(state);
+                }
+            }
+
+            Ok("NOT_FOUND".to_string())
+        },
+    )?;
+
     println!("Virtual tables ready for data access");
+    println!("Custom function 'check_if_cluster_is_active(display_name)' registered");
     Ok(())
 }
 
-/// Setup virtual tables in the given connection
+fn wait_for_active_state(
+    conn: &mut SQLiteConnection,
+    display_name: &str,
+) -> Result<Option<(String, i32)>, Box<dyn std::error::Error>> {
+    let mut iteration = 1;
+    const MAX_ITERATIONS: i32 = 100;
+    let start_time = Instant::now();
+
+    while iteration <= MAX_ITERATIONS {
+        let mut stmt = conn.prepare("SELECT state FROM tidb_clusters WHERE display_name = ?1")?;
+        let mut rows = stmt.query([display_name])?;
+
+        if let Some(row) = rows.next()? {
+            let state: String = row.get(0)?;
+            if state.to_lowercase() == "active" {
+                return Ok(Some((state, iteration)));
+            }
+        }
+
+        iteration += 1;
+        println!(
+            "Time elapsed: {:?} - Cluster '{}' not active yet, sleeping...",
+            start_time.elapsed(),
+            display_name
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    Ok(None)
+}
+
+fn populate_rowid_mappings(conn: &mut SQLiteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Populating rowid mappings for virtual tables...");
+
+    // Query each virtual table to populate the rowid mappings
+    // This will trigger the filter() method which populates the global mappings
+
+    // Populate clusters mapping
+    if let Ok(mut stmt) = conn.prepare("SELECT COUNT(*) FROM tidb_clusters")
+        && let Ok(mut rows) = stmt.query([])
+        && let Some(row) = rows.next()?
+    {
+        let count: i32 = row.get(0).unwrap_or(0);
+        println!("✅ Initialized rowid mapping for {count} clusters");
+    }
+
+    // Populate backups mapping
+    if let Ok(mut stmt) = conn.prepare("SELECT COUNT(*) FROM tidb_backups")
+        && let Ok(mut rows) = stmt.query([])
+        && let Some(row) = rows.next()?
+    {
+        let count: i32 = row.get(0).unwrap_or(0);
+        println!("✅ Initialized rowid mapping for {count} backups");
+    }
+
+    // Note: Network access mappings are now handled per-cluster via tidb_<cluster_id>_network_access tables
+
+    println!("Rowid mappings populated successfully");
+    Ok(())
+}
+
 fn setup_virtual_tables_in_connection(
     conn: &mut SQLiteConnection,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Create the virtual table instances
     conn.execute_batch(
         r#"
         CREATE VIRTUAL TABLE IF NOT EXISTS tidb_clusters USING tidb_clusters;
@@ -352,113 +239,303 @@ fn setup_virtual_tables_in_connection(
         "#,
     )?;
 
-    // Create the public_endpoints view using the virtual table
     conn.execute_batch(
         r#"
-        CREATE VIEW IF NOT EXISTS public_endpoints AS 
+        CREATE VIEW IF NOT EXISTS tidb_endpoints AS
         SELECT 
-            c.tidb_id,
-            json_extract(endpoints.value, '$.type') as endpoint_type,
-            json_extract(endpoints.value, '$.address') as address,
-            json_extract(endpoints.value, '$.port') as port,
-            json_extract(endpoints.value, '$.subnet') as subnet,
-            endpoints.value as raw_data
-        FROM tidb_clusters c, json_each(c.raw_data, '$.endpoints') as endpoints;
+            json_extract(endpoint.value, '$.host') || ':' || json_extract(endpoint.value, '$.port') as endpoint_id,
+            tidb_id,
+            json_extract(endpoint.value, '$.host') as host,
+            json_extract(endpoint.value, '$.port') as port,
+            json_extract(endpoint.value, '$.connectionType') as connection_type,
+            endpoint.value as raw_data
+        FROM tidb_clusters,
+        json_each(json_extract(raw_data, '$.endpoints')) as endpoint
+        WHERE json_extract(endpoint.value, '$.host') IS NOT NULL
+        AND json_extract(endpoint.value, '$.port') IS NOT NULL;
         "#,
     )?;
 
-    // Populate with fresh data
     fetch_fresh_data_from_api(conn)?;
+
+    if let Err(e) = vtable::initialize_cluster_access_tables(conn) {
+        eprintln!("Warning: Failed to initialize cluster-specific access tables: {e}");
+    }
+
+    // Populate rowid mappings for DELETE/UPDATE operations
+    if let Err(e) = populate_rowid_mappings(conn) {
+        eprintln!("Warning: Failed to populate rowid mappings: {e}");
+    }
 
     Ok(())
 }
 
-fn show_virtual_tables() -> Result<(), Box<dyn std::error::Error>> {
+fn show_virtual_tables_with_client(
+    client: &TiDBCloudClient,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "Available Virtual Tables:".green());
     println!();
-    println!("{}", "1. tidb_clusters".blue());
-    println!("   - Contains TiDB cluster information");
-    println!(
-        "   - Fields: tidb_id, name, display_name, region_id, state, create_time, root_password, min_rcu, max_rcu, service_plan, cloud_provider, region_display_name, raw_data"
-    );
-    println!("   - Supports WHERE constraints on: state, region_id, cloud_provider");
-    println!();
-    println!("{}", "2. tidb_backups".blue());
-    println!("   - Contains backup information for clusters");
-    println!("   - Fields: backup_id, tidb_id, backup_name, status, size_bytes, raw_data");
-    println!("   - Supports WHERE constraints on: tidb_id");
-    println!();
-    println!("{}", "3. config".blue());
-    println!("   - Contains configuration and metadata");
-    println!("   - Fields: key, value, raw_data");
-    println!();
-    println!("{}", "4. public_endpoints (View)".blue());
-    println!("   - Materialized view of cluster endpoints");
-    println!("   - Extracted from tidb_clusters.raw_data JSON field");
-    println!("   - Fields: tidb_id, endpoint_type, address, port, subnet, raw_data");
+
+    let mut conn = SQLiteConnection::new_in_memory()?;
+    register_module(&conn, client)?;
+    setup_virtual_tables_in_connection(&mut conn)?;
+
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+    let table_rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+    let mut counter = 1;
+    for table_result in table_rows {
+        let table_name = table_result?;
+
+        // Skip internal SQLite tables
+        if table_name.starts_with("sqlite_") {
+            continue;
+        }
+
+        println!("{}", format!("{counter}. {table_name}").blue());
+
+        // Get table schema information
+        match get_table_info(&conn, &table_name) {
+            Ok(info) => {
+                println!("   - {}", info.description);
+                if !info.fields.is_empty() {
+                    println!("   - Fields: {}", info.fields.join(", "));
+                }
+                if !info.constraints.is_empty() {
+                    println!(
+                        "   - Supports WHERE constraints on: {}",
+                        info.constraints.join(", ")
+                    );
+                }
+                if !info.operations.is_empty() {
+                    println!("   - Operations: {}", info.operations.join(", "));
+                }
+            }
+            Err(_) => {
+                // Fallback for any table we can't get info for
+                println!("   - Available for SQL queries");
+            }
+        }
+        println!();
+        counter += 1;
+    }
+
+    if let Ok(tables) = vtable::get_dynamic_cluster_tables().lock() {
+        for cluster_id in tables.iter() {
+            let table_name = format!("tidb_{cluster_id}_network_access");
+            println!("{}", format!("{counter}. {table_name}").blue());
+            println!("   - Network access configuration for cluster {cluster_id}");
+            println!("   - Fields: cidr_notation, description, enabled, tidb_id, raw_data");
+            println!("   - Operations: SELECT, INSERT, UPDATE, DELETE");
+            println!();
+            counter += 1;
+        }
+    }
+
+    println!("{}", "Special Commands:".yellow());
+    println!("  .reload  - Drop all tables and recreate with fresh data from API");
+    println!("  .tables  - Show available tables");
+    println!("  .schema  - Show table schemas");
+    println!("  call check_cluster_is_active('name');  - Poll until cluster state is active");
     println!();
     println!("{}", "Example Queries:".yellow());
     println!("  SELECT * FROM tidb_clusters WHERE state = 'ACTIVE';");
     println!("  SELECT display_name, min_rcu, max_rcu FROM tidb_clusters;");
     println!("  SELECT * FROM tidb_backups WHERE tidb_id = 'your_cluster_id';");
-    println!("  SELECT * FROM public_endpoints WHERE endpoint_type = 'TIDB';");
+    println!("  SELECT * FROM tidb_network_access WHERE tidb_id = 'your_cluster_id';");
+    println!("  SELECT * FROM tidb_endpoints WHERE connection_type = 'Public';");
     println!();
     println!("{}", "Note:".red());
     println!("  - All input is passed directly to SQLite for execution");
     println!("  - True virtual tables with on-demand data access");
     println!("  - SQLite handles constraint optimization via best_index");
-    println!("  - Materialized view for complex data extraction");
+    println!("  - Virtual tables provide direct API integration");
 
     Ok(())
 }
 
-fn show_examples() {
-    println!("{}", "TiDB Cloud SQL Examples:".green());
+#[derive(Debug)]
+struct TableInfo {
+    description: String,
+    fields: Vec<String>,
+    constraints: Vec<String>,
+    operations: Vec<String>,
+}
+
+fn display_schema_information(conn: &SQLiteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "Table schemas:".green());
     println!();
-    println!("{}", "Basic Queries:".blue());
-    println!("  SELECT * FROM tidb_clusters;");
-    println!("  SELECT display_name, state FROM tidb_clusters WHERE state = 'ACTIVE';");
-    println!("  SELECT COUNT(*) FROM tidb_clusters;");
-    println!();
-    println!("{}", "Backup Operations:".blue());
-    println!("  SELECT * FROM tidb_backups;");
-    println!("  SELECT backup_name, status FROM tidb_backups WHERE tidb_id = 'your_cluster_id';");
-    println!();
-    println!("{}", "Complex Queries:".blue());
-    println!("  SELECT c.display_name, COUNT(b.backup_id) as backup_count");
-    println!("  FROM tidb_clusters c");
-    println!("  LEFT JOIN tidb_backups b ON c.tidb_id = b.tidb_id");
-    println!("  WHERE c.state = 'ACTIVE';");
-    println!();
-    println!("{}", "Ordering and Limiting:".blue());
-    println!(
-        "  SELECT display_name, create_time FROM tidb_clusters ORDER BY create_time DESC LIMIT 10;"
-    );
-    println!("  SELECT * FROM backups ORDER BY create_time DESC LIMIT 5;");
+
+    let mut stmt =
+        conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let sql: String = row.get(0)?;
+        println!("{sql}");
+        println!();
+    }
+
+    println!("{}", "-- TiDB Virtual Tables".blue());
+    display_virtual_table_schema(conn, "tidb_clusters")?;
+    display_virtual_table_schema(conn, "tidb_backups")?;
+    display_virtual_table_schema(conn, "tidb_network_access")?;
+
+    // Display views
+    let mut view_stmt =
+        conn.prepare("SELECT sql FROM sqlite_master WHERE type='view' AND sql IS NOT NULL")?;
+    let mut view_rows = view_stmt.query([])?;
+    while let Some(row) = view_rows.next()? {
+        let sql: String = row.get(0)?;
+        println!("{sql}");
+        println!();
+    }
+
+    if let Ok(tables) = vtable::get_dynamic_cluster_tables().lock() {
+        for cluster_id in tables.iter() {
+            let table_name = format!("tidb_{cluster_id}_access_list");
+            println!("CREATE VIRTUAL TABLE {table_name} (");
+            println!("    cidr_notation TEXT,");
+            println!("    description TEXT");
+            println!(");");
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+fn display_virtual_table_schema(
+    conn: &SQLiteConnection,
+    table_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Use PRAGMA table_info to get actual column information from the virtual table
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let column_rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        let type_name: String = row.get(2)?;
+        Ok((name, type_name))
+    })?;
+
+    let mut columns = Vec::new();
+    for col_result in column_rows {
+        let (name, type_name) = col_result?;
+        columns.push(format!("    {name} {type_name}"));
+    }
+
+    if !columns.is_empty() {
+        println!("CREATE VIRTUAL TABLE {table_name} (");
+        for (i, column) in columns.iter().enumerate() {
+            if i == columns.len() - 1 {
+                println!("{column}");
+            } else {
+                println!("{column},");
+            }
+        }
+        println!(");");
+        println!();
+    }
+
+    Ok(())
+}
+
+fn get_table_info(
+    conn: &SQLiteConnection,
+    table_name: &str,
+) -> Result<TableInfo, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let column_rows = stmt.query_map([], |row| {
+        row.get::<_, String>(1) // column name is at index 1
+    })?;
+
+    let mut fields = Vec::new();
+    for col_result in column_rows {
+        fields.push(col_result?);
+    }
+
+    let info = match table_name {
+        "tidb_clusters" => TableInfo {
+            description: "Contains TiDB cluster information".to_string(),
+            fields,
+            constraints: vec![
+                "state".to_string(),
+                "region_id".to_string(),
+                "cloud_provider".to_string(),
+            ],
+            operations: vec![
+                "SELECT".to_string(),
+                "INSERT".to_string(),
+                "UPDATE".to_string(),
+                "DELETE".to_string(),
+            ],
+        },
+        "tidb_backups" => TableInfo {
+            description: "Contains backup information for clusters".to_string(),
+            fields,
+            constraints: vec!["tidb_id".to_string()],
+            operations: vec![
+                "SELECT".to_string(),
+                "INSERT".to_string(),
+                "UPDATE".to_string(),
+                "DELETE".to_string(),
+            ],
+        },
+        "tidb_network_access" => TableInfo {
+            description: "Contains network access settings for clusters".to_string(),
+            fields,
+            constraints: vec!["tidb_id".to_string()],
+            operations: vec![
+                "SELECT".to_string(),
+                "INSERT".to_string(),
+                "UPDATE".to_string(),
+            ],
+        },
+        "config" => TableInfo {
+            description: "Contains configuration and metadata".to_string(),
+            fields,
+            constraints: vec![],
+            operations: vec!["SELECT".to_string()],
+        },
+        "tidb_endpoints" => TableInfo {
+            description: "Contains endpoint information for clusters (materialized view)"
+                .to_string(),
+            fields,
+            constraints: vec![],
+            operations: vec!["SELECT".to_string()],
+        },
+        _ => {
+            // For any dynamic tables or unknown tables
+            TableInfo {
+                description: "Available for SQL queries".to_string(),
+                fields,
+                constraints: vec![],
+                operations: vec!["SELECT".to_string()],
+            }
+        }
+    };
+
+    Ok(info)
 }
 
 fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "TiDB Cloud SQL Shell".green());
     println!("All input is passed directly to SQLite for execution");
-    println!("Type 'quit' or 'exit' to exit the shell");
+    println!(
+        "Type 'help' for available tables, '.reload' to refresh data, 'quit' or 'exit' to exit"
+    );
     println!();
 
     let mut rl = DefaultEditor::new()?;
 
-    // Load command history
-    if let Err(err) = rl.load_history("tidb_cli_history.txt") {
-        // It's okay if the history file doesn't exist yet
-        if !matches!(err, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
-        {
-            eprintln!("Failed to load history: {err}");
-        }
+    if let Err(err) = rl.load_history("tidb_cli_history.txt")
+        && !matches!(err, ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+    {
+        eprintln!("Failed to load history: {err}");
     }
 
-    // Create SQLite connection with virtual tables
     let mut conn = SQLiteConnection::new_in_memory()?;
     register_module(&conn, client)?;
 
-    // Create virtual tables
     setup_virtual_tables_in_connection(&mut conn)?;
 
     loop {
@@ -474,7 +551,7 @@ fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error:
 
                 match line.to_lowercase().as_str() {
                     "help" | "h" => {
-                        if let Err(e) = show_virtual_tables() {
+                        if let Err(e) = show_virtual_tables_with_client(client) {
                             println!("{}: {}", "Error".red(), e);
                         }
                     }
@@ -483,14 +560,12 @@ fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error:
                         break;
                     }
                     _ => {
-                        // Execute SQL query (or any other SQLite command)
-                        if let Err(e) = execute_query_in_shell(line, &mut conn) {
+                        if let Err(e) = execute_query(line, &mut conn) {
                             println!("{}: {}", "Error".red(), e);
                         }
                     }
                 }
 
-                // Add line to history
                 if let Err(err) = rl.add_history_entry(line) {
                     eprintln!("Failed to add to history: {err}");
                 }
@@ -510,7 +585,6 @@ fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error:
         }
     }
 
-    // Save command history
     if let Err(err) = rl.save_history("tidb_cli_history.txt") {
         eprintln!("Failed to save history: {err}");
     }
@@ -518,72 +592,13 @@ fn interactive_shell(client: &TiDBCloudClient) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn execute_query_in_shell(
-    input: &str,
+fn execute_query_with_results(
+    query: &str,
     conn: &mut SQLiteConnection,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let input = input.trim();
-
-    // Handle special SQLite-like commands
-    match input.to_lowercase().as_str() {
-        ".tables" => {
-            // Show available tables
-            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
-            let mut rows = stmt.query([])?;
-
-            println!("{}", "Available tables:".green());
-            while let Some(row) = rows.next()? {
-                let table_name: String = row.get(0)?;
-                println!("  {table_name}");
-            }
-            return Ok(());
-        }
-        ".schema" => {
-            // Show schema for all tables
-            let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table'")?;
-            let mut rows = stmt.query([])?;
-
-            println!("{}", "Table schemas:".green());
-            while let Some(row) = rows.next()? {
-                let sql: String = row.get(0)?;
-                println!("{sql}");
-                println!();
-            }
-            return Ok(());
-        }
-        _ => {}
-    }
-    // Check if it's a DELETE statement
-    if input.to_uppercase().starts_with("DELETE FROM") {
-        match parse_delete_statement(input) {
-            Ok((table_name, where_clause)) => {
-                println!("{}", "Parsed DELETE statement:".green());
-                println!("Table: {table_name}");
-                if let Some(where_clause) = where_clause {
-                    println!("WHERE: {where_clause}");
-                }
-
-                // For now, just show what would be sent to the API
-                println!(
-                    "{}",
-                    "Note: API calls not yet implemented in synchronous mode".yellow()
-                );
-
-                // Refresh data after operation
-                fetch_fresh_data_from_api(conn)?;
-            }
-            Err(e) => {
-                println!("{}: {}", "Error parsing DELETE statement".red(), e);
-            }
-        }
-        return Ok(());
-    }
-
-    // Execute as regular SQL query
-    let mut stmt = conn.prepare(input)?;
+) -> Result<QueryResult, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(query)?;
     let column_count = stmt.column_count();
 
-    // Get column names first
     let mut headers = Vec::new();
     for i in 0..column_count {
         headers.push(stmt.column_name(i).unwrap_or("unknown").to_string());
@@ -598,9 +613,16 @@ fn execute_query_in_shell(
         all_rows.push(values);
     }
 
-    // Calculate column widths for alignment
+    Ok((headers, all_rows))
+}
+
+fn display_query_results(headers: &[String], all_rows: &[Vec<String>]) {
+    if headers.is_empty() {
+        return;
+    }
+
     let mut col_widths = headers.iter().map(|h| h.len()).collect::<Vec<_>>();
-    for row in &all_rows {
+    for row in all_rows {
         for (i, value) in row.iter().enumerate() {
             if i < col_widths.len() {
                 col_widths[i] = col_widths[i].max(value.len());
@@ -608,35 +630,31 @@ fn execute_query_in_shell(
         }
     }
 
-    // Display results
     println!("{}", "Query Results:".green());
 
-    // Print column headers with proper alignment
     let header_line = headers
         .iter()
         .enumerate()
         .map(|(i, h)| format!("{:<width$}", h, width = col_widths[i]))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{}", header_line);
+    println!("{header_line}");
 
-    // Print separator line
     let separator = col_widths
         .iter()
         .map(|&width| "-".repeat(width))
         .collect::<Vec<_>>()
         .join("  ");
-    println!("{}", separator);
+    println!("{separator}");
 
-    // Print data rows with proper alignment
-    for row in &all_rows {
+    for row in all_rows {
         let row_line = row
             .iter()
             .enumerate()
             .map(|(i, value)| format!("{:<width$}", value, width = col_widths.get(i).unwrap_or(&0)))
             .collect::<Vec<_>>()
             .join("  ");
-        println!("{}", row_line);
+        println!("{row_line}");
     }
 
     if !all_rows.is_empty() {
@@ -644,6 +662,360 @@ fn execute_query_in_shell(
     } else {
         println!("{}", "No rows returned".yellow());
     }
+}
+
+fn strip_comments(input: &str) -> &str {
+    let input = input.trim();
+
+    // Find the position of comment markers
+    let hash_pos = input.find('#');
+    let dash_pos = input.find("--");
+
+    // Determine the earliest comment position
+    let comment_pos = match (hash_pos, dash_pos) {
+        (Some(h), Some(d)) => Some(h.min(d)),
+        (Some(h), None) => Some(h),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    };
+
+    // If we found a comment, return everything before it (trimmed)
+    if let Some(pos) = comment_pos {
+        input[..pos].trim()
+    } else {
+        input
+    }
+}
+
+fn execute_query(
+    input: &str,
+    conn: &mut SQLiteConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = strip_comments(input);
+
+    match input.to_lowercase().as_str() {
+        ".tables" => {
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'")?;
+            let mut rows = stmt.query([])?;
+
+            println!("{}", "Available tables:".green());
+            while let Some(row) = rows.next()? {
+                let table_name: String = row.get(0)?;
+                println!("  {table_name}");
+            }
+            return Ok(());
+        }
+        ".schema" => {
+            display_schema_information(conn)?;
+            return Ok(());
+        }
+        ".reload" => {
+            println!(
+                "{}",
+                "Reloading all tables and data from TiDB Cloud API...".yellow()
+            );
+            if let Err(e) = reload_all_tables(conn) {
+                println!("{}: Failed to reload tables: {}", "Error".red(), e);
+            } else {
+                println!("{}", "✅ Successfully reloaded all tables and data".green());
+            }
+            return Ok(());
+        }
+        _ => {
+            if input.starts_with("call check_cluster_is_active(") && input.ends_with(");") {
+                let display_name = input
+                    .strip_prefix("call ")
+                    .unwrap()
+                    .strip_suffix(");")
+                    .unwrap();
+                if display_name.is_empty() {
+                    println!(
+                        "{}: Usage: call check_cluster_is_active(<display_name>)",
+                        "Error".red()
+                    );
+                } else {
+                    match wait_for_active_state(conn, display_name) {
+                        Ok(Some((state, iterations))) => {
+                            println!(
+                                "✅ Cluster '{display_name}' is now {state} (checked {iterations} times)"
+                            );
+                        }
+                        Ok(None) => {
+                            println!(
+                                "❌ Cluster '{display_name}' did not become active within maximum iterations"
+                            );
+                        }
+                        Err(e) => {
+                            println!("{}: {}", "Error".red(), e);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            if let Some(display_name) = parse_check_cluster_is_active_call(input) {
+                match wait_for_active_state(conn, &display_name) {
+                    Ok(Some((state, iterations))) => {
+                        println!(
+                            "✅ Cluster '{display_name}' is now {state} (checked {iterations} times)"
+                        );
+                    }
+                    Ok(None) => {
+                        println!(
+                            "❌ Cluster '{display_name}' did not become active within maximum iterations"
+                        );
+                    }
+                    Err(e) => {
+                        println!("{}: {}", "Error".red(), e);
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Check if this is a DROP TABLE command on a protected access list table
+    if is_protected_access_list_drop_attempt(input) {
+        println!(
+            "{}: Cannot drop cluster-specific access list tables manually.",
+            "Error".red()
+        );
+        println!("These tables are managed automatically by the virtual table infrastructure.");
+        println!("Access list tables are automatically created when clusters are created");
+        println!("and automatically dropped when clusters are deleted.");
+        return Ok(());
+    }
+
+    // Check if this is a DELETE from tidb_clusters to handle cleanup
+    let is_cluster_delete = input.to_lowercase().contains("delete")
+        && input.to_lowercase().contains("from")
+        && input.to_lowercase().contains("tidb_clusters");
+
+    // Get cluster IDs before deletion for cleanup
+    let clusters_to_cleanup = if is_cluster_delete {
+        get_clusters_to_be_deleted(input, conn).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let start_time = Instant::now();
+
+    let result = execute_query_with_results(input, conn);
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok((headers, all_rows)) => {
+            let is_select = !headers.is_empty();
+
+            if is_select {
+                display_query_results(&headers, &all_rows);
+            }
+
+            // Handle cluster deletion cleanup
+            if is_cluster_delete && !clusters_to_cleanup.is_empty() {
+                handle_cluster_deletion_cleanup(conn, &clusters_to_cleanup);
+            }
+
+            println!(
+                "{}",
+                format!("Elapsed: {:.3}s", elapsed.as_secs_f64()).blue()
+            );
+        }
+        Err(e) => {
+            println!("{}: {}", "Error".red(), e);
+            println!(
+                "{}",
+                format!("Elapsed: {:.3}s", elapsed.as_secs_f64()).blue()
+            );
+        }
+    }
 
     Ok(())
+}
+
+fn parse_check_cluster_is_active_call(input: &str) -> Option<String> {
+    let input = input.trim().to_lowercase();
+
+    if !input.starts_with("call check_cluster_is_active") {
+        return None;
+    }
+
+    let after_call = input.strip_prefix("call check_cluster_is_active")?;
+    let after_call = after_call.trim();
+
+    if !after_call.starts_with('(') || !after_call.ends_with(");") && !after_call.ends_with(')') {
+        return None;
+    }
+
+    let paren_content = if after_call.ends_with(");") {
+        after_call.strip_prefix('(')?.strip_suffix(");")?
+    } else {
+        after_call.strip_prefix('(')?.strip_suffix(')')?
+    };
+
+    let paren_content = paren_content.trim();
+
+    if (paren_content.starts_with('\'') && paren_content.ends_with('\''))
+        || (paren_content.starts_with('"') && paren_content.ends_with('"'))
+    {
+        let cluster_name = &paren_content[1..paren_content.len() - 1];
+        if !cluster_name.is_empty() {
+            return Some(cluster_name.to_string());
+        }
+    }
+
+    if !paren_content.is_empty() && !paren_content.contains(' ') {
+        return Some(paren_content.to_string());
+    }
+
+    None
+}
+
+fn reload_all_tables(conn: &mut SQLiteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🧹 Cleaning up existing tables...");
+    cleanup_all_tables(conn)?;
+
+    println!("🔄 Recreating tables and fetching fresh data...");
+    setup_virtual_tables_in_connection(conn)?;
+
+    Ok(())
+}
+
+fn cleanup_all_tables(conn: &mut SQLiteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster_tables = if let Ok(tables) = vtable::get_dynamic_cluster_tables().lock() {
+        tables.clone()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    for cluster_id in cluster_tables.iter() {
+        if let Err(e) = vtable::drop_cluster_access_table(conn, cluster_id) {
+            eprintln!("Warning: Failed to drop access table for cluster {cluster_id}: {e}");
+        }
+    }
+
+    if let Ok(mut tables) = vtable::get_dynamic_cluster_tables().lock() {
+        tables.clear();
+    }
+
+    let drop_views = vec!["DROP VIEW IF EXISTS tidb_endpoints"];
+
+    for view_sql in drop_views {
+        if let Err(e) = conn.execute(view_sql, []) {
+            eprintln!("Warning: Failed to drop view: {view_sql} - {e}");
+        }
+    }
+
+    let drop_tables = vec![
+        "DROP TABLE IF EXISTS tidb_clusters",
+        "DROP TABLE IF EXISTS tidb_backups",
+        "DROP TABLE IF EXISTS tidb_network_access",
+        "DROP TABLE IF EXISTS config",
+    ];
+
+    for table_sql in drop_tables {
+        if let Err(e) = conn.execute(table_sql, []) {
+            eprintln!("Warning: Failed to drop table: {table_sql} - {e}");
+        }
+    }
+
+    clear_rowid_mappings();
+
+    println!("✅ Cleanup completed");
+    Ok(())
+}
+
+fn clear_rowid_mappings() {
+    vtable::clear_all_rowid_mappings();
+}
+
+fn is_protected_access_list_drop_attempt(query: &str) -> bool {
+    let query_lower = query.to_lowercase();
+
+    if !query_lower.contains("drop") || !query_lower.contains("table") {
+        return false;
+    }
+
+    // Extract table name from DROP TABLE statement
+    // Handle various forms: "DROP TABLE name", "DROP TABLE IF EXISTS name", etc.
+    let parts: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut table_name = "";
+
+    // Find the table name after DROP TABLE [IF EXISTS]
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "table" {
+            // Check if next part is "if", then skip to table name
+            if i + 1 < parts.len() {
+                if parts[i + 1] == "if" && i + 3 < parts.len() && parts[i + 2] == "exists" {
+                    // DROP TABLE IF EXISTS table_name
+                    if i + 3 < parts.len() {
+                        table_name = parts[i + 3];
+                    }
+                } else {
+                    // DROP TABLE table_name
+                    table_name = parts[i + 1];
+                }
+                break;
+            }
+        }
+    }
+
+    // Check if the table name matches the pattern for cluster-specific access list tables
+    // Pattern: tidb_<cluster_id>_access_list where cluster_id is not empty
+    if table_name.starts_with("tidb_") && table_name.ends_with("_access_list") {
+        // Extract the middle part (cluster_id) and ensure it's not empty
+        let prefix_len = "tidb_".len();
+        let suffix_len = "_access_list".len();
+        if table_name.len() > prefix_len + suffix_len {
+            let cluster_id = &table_name[prefix_len..table_name.len() - suffix_len];
+            !cluster_id.is_empty() && !cluster_id.contains('_') // Cluster ID shouldn't contain underscores
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// Extract cluster IDs that will be deleted from a DELETE query
+fn get_clusters_to_be_deleted(
+    delete_query: &str,
+    conn: &mut SQLiteConnection,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    // Convert DELETE to SELECT to preview what will be deleted
+    let select_query = delete_query.to_lowercase().replace(
+        "delete from tidb_clusters",
+        "select tidb_id from tidb_clusters",
+    );
+
+    let mut stmt = conn.prepare(&select_query)?;
+    let mut rows = stmt.query([])?;
+    let mut cluster_ids = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let tidb_id: String = row.get(0)?;
+        cluster_ids.push(tidb_id);
+    }
+
+    Ok(cluster_ids)
+}
+
+/// Handle cleanup of cluster-specific access list tables after cluster deletion
+fn handle_cluster_deletion_cleanup(conn: &SQLiteConnection, cluster_ids: &[String]) {
+    for cluster_id in cluster_ids {
+        if let Err(e) = vtable::drop_cluster_access_table(conn, cluster_id) {
+            eprintln!(
+                "{}: Failed to drop access list table for cluster {}: {}",
+                "Warning".yellow(),
+                cluster_id,
+                e
+            );
+        } else {
+            println!(
+                "{}: Cleaned up access list table for deleted cluster {}",
+                "✅".green(),
+                cluster_id
+            );
+        }
+    }
 }

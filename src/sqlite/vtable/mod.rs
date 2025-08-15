@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::debug;
 
 pub mod api_bridge;
-use api_bridge::{BackupData, ClusterData, PublicEndpointData};
+use api_bridge::{BackupData, ClusterData, NetworkAccessData};
 
 // Global mapping from rowid to tidb_id for cluster deletions
 static CLUSTER_ROWID_MAP: OnceLock<Arc<Mutex<HashMap<i64, String>>>> = OnceLock::new();
@@ -34,12 +34,124 @@ fn get_backup_rowid_map() -> &'static BackupRowidMap {
     BACKUP_ROWID_MAP.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
-// Global mapping from rowid to (tidb_id, endpoint_id) for public endpoint deletions
-type PublicEndpointRowidMap = Arc<Mutex<HashMap<i64, (String, String)>>>;
-static PUBLIC_ENDPOINT_ROWID_MAP: OnceLock<PublicEndpointRowidMap> = OnceLock::new();
+// Global mapping from rowid to (tidb_id, cidr_notation) for network access updates/deletes
+type NetworkAccessRowidMap = Arc<Mutex<HashMap<i64, (String, String)>>>;
+static NETWORK_ACCESS_ROWID_MAP: OnceLock<NetworkAccessRowidMap> = OnceLock::new();
 
-fn get_public_endpoint_rowid_map() -> &'static PublicEndpointRowidMap {
-    PUBLIC_ENDPOINT_ROWID_MAP.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+fn get_network_access_rowid_map() -> &'static NetworkAccessRowidMap {
+    NETWORK_ACCESS_ROWID_MAP.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+// Global registry for tracking dynamic cluster-specific tables
+static DYNAMIC_CLUSTER_TABLES: OnceLock<Arc<Mutex<std::collections::HashSet<String>>>> =
+    OnceLock::new();
+
+pub fn get_dynamic_cluster_tables() -> &'static Arc<Mutex<std::collections::HashSet<String>>> {
+    DYNAMIC_CLUSTER_TABLES.get_or_init(|| Arc::new(Mutex::new(std::collections::HashSet::new())))
+}
+
+/// Create a cluster-specific network access virtual table
+pub fn create_cluster_access_table(conn: &Connection, cluster_id: &str) -> SqliteResult<()> {
+    // Register the module for this specific cluster
+    let module_name = format!("tidb_{cluster_id}_network_access");
+
+    conn.create_module(
+        module_name.as_str(),
+        rusqlite::vtab::update_module::<TidbClusterNetworkAccessTab>(),
+        Some(cluster_id.to_string()),
+    )?;
+
+    // Create the virtual table instance
+    let table_name = format!("tidb_{cluster_id}_network_access");
+    let sql = format!("CREATE VIRTUAL TABLE IF NOT EXISTS {table_name} USING {module_name}");
+
+    conn.execute(&sql, [])?;
+
+    // Track this table in our registry
+    if let Ok(mut tables) = get_dynamic_cluster_tables().lock() {
+        tables.insert(cluster_id.to_string());
+    }
+
+    debug!(
+        "✅ Created cluster-specific network access table: {}",
+        table_name
+    );
+    Ok(())
+}
+
+/// Drop a cluster-specific network access virtual table
+pub fn drop_cluster_access_table(conn: &Connection, cluster_id: &str) -> SqliteResult<()> {
+    let table_name = format!("tidb_{cluster_id}_network_access");
+
+    // Drop the virtual table
+    let sql = format!("DROP TABLE IF EXISTS {table_name}");
+    conn.execute(&sql, [])?;
+
+    // Remove from our registry
+    if let Ok(mut tables) = get_dynamic_cluster_tables().lock() {
+        tables.remove(cluster_id);
+    }
+
+    debug!(
+        "✅ Dropped cluster-specific network access table: {}",
+        table_name
+    );
+    Ok(())
+}
+
+/// Clear all rowid mappings (for reload operations)
+pub fn clear_all_rowid_mappings() {
+    // Clear cluster rowid mappings
+    if let Ok(mut map) = get_cluster_rowid_map().lock() {
+        map.clear();
+    }
+
+    // Clear backup rowid mappings
+    if let Ok(mut map) = get_backup_rowid_map().lock() {
+        map.clear();
+    }
+
+    // Clear network access rowid mappings
+    if let Ok(mut map) = get_network_access_rowid_map().lock() {
+        map.clear();
+    }
+}
+
+/// Initialize cluster-specific access tables for all existing clusters
+pub fn initialize_cluster_access_tables(conn: &Connection) -> SqliteResult<()> {
+    debug!("🚀 Initializing cluster-specific access tables for existing clusters...");
+
+    // Fetch all existing clusters
+    match api_bridge::fetch_clusters() {
+        Ok(clusters) => {
+            for cluster in clusters {
+                if let Err(e) = create_cluster_access_table(conn, &cluster.tidb_id) {
+                    debug!(
+                        "⚠️ Failed to create access table for cluster {}: {}",
+                        cluster.tidb_id, e
+                    );
+                    // Continue with other clusters even if one fails
+                }
+            }
+
+            let table_count = if let Ok(tables) = get_dynamic_cluster_tables().lock() {
+                tables.len()
+            } else {
+                0
+            };
+
+            debug!(
+                "✅ Initialized {} cluster-specific access tables",
+                table_count
+            );
+            Ok(())
+        }
+        Err(e) => {
+            debug!("⚠️ Failed to fetch clusters for initialization: {}", e);
+            // Don't fail the entire setup if cluster fetch fails
+            Ok(())
+        }
+    }
 }
 
 // Column constants for the clusters virtual table
@@ -61,13 +173,12 @@ const COL_RAW_DATA: c_int = 12;
 const COL_BACKUP_TIDB_ID: c_int = 1;
 const COL_BACKUP_DESCRIPTION: c_int = 3;
 
-// Column constants for the public_endpoints virtual table
-const COL_ENDPOINT_ID: c_int = 0;
-const COL_ENDPOINT_TIDB_ID: c_int = 1;
-const COL_HOST: c_int = 2;
-const COL_PORT: c_int = 3;
-const COL_CONNECTION_TYPE: c_int = 4;
-const COL_ENDPOINT_RAW_DATA: c_int = 5;
+// Column constants for the network_access virtual table
+const COL_NETWORK_TIDB_ID: c_int = 0;
+const COL_NETWORK_ENABLED: c_int = 1;
+const COL_NETWORK_CIDR_NOTATION: c_int = 2;
+const COL_NETWORK_DESCRIPTION: c_int = 3;
+const COL_NETWORK_RAW_DATA: c_int = 4;
 
 // Constraint masks for best_index
 const MASK_STATE: c_int = 1;
@@ -97,15 +208,13 @@ pub fn register_module(conn: &Connection, client: &TiDBCloudClient) -> SqliteRes
         None::<()>,
     )?;
 
-    // Register the public_endpoints virtual table (read-only for now)
-    conn.create_module(
-        "tidb_public_endpoints",
-        rusqlite::vtab::read_only_module::<TidbPublicEndpointsTab>(),
-        None::<()>,
-    )?;
+    // Note: network_access is now handled per-cluster via dynamic cluster-specific tables
+    // The global tidb_network_access table is removed in favor of tidb_<cluster_id>_network_access tables
 
     debug!("Virtual table modules registered successfully");
-    debug!("Available tables: tidb_clusters, tidb_backups, tidb_public_endpoints");
+    debug!(
+        "Available tables: tidb_clusters, tidb_backups, tidb_<cluster_id>_network_access (per cluster)"
+    );
     debug!("Note: Using TiDB Cloud API integration with async-to-sync conversion.");
     Ok(())
 }
@@ -262,8 +371,10 @@ impl UpdateVTab<'_> for TidbClustersTab {
             &service_plan,
             &cloud_provider,
         ) {
-            Ok(_tidb_id) => {
-                debug!("✅ Created cluster: {display_name}");
+            Ok(tidb_id) => {
+                debug!("✅ Created cluster: {display_name} with ID: {}", tidb_id);
+                // Note: Dynamic table creation needs to be handled externally due to SQLite connection access limitations
+                // The main application should call create_cluster_access_table() after successful cluster creation
                 Ok(1) // Return a rowid for the new row
             }
             Err(e) => Err(rusqlite::Error::ModuleError(format!("Insert failed: {e}"))),
@@ -293,6 +404,9 @@ impl UpdateVTab<'_> for TidbClustersTab {
                         if let Ok(mut map) = rowid_map.lock() {
                             map.remove(&rowid_val);
                         }
+
+                        // Note: Dynamic table cleanup needs to be handled externally due to SQLite connection access limitations
+                        // The main application should call drop_cluster_access_table() after successful cluster deletion
 
                         Ok(())
                     }
@@ -504,22 +618,37 @@ impl CreateVTab<'_> for TidbBackupsTab {
 
 impl UpdateVTab<'_> for TidbBackupsTab {
     fn insert(&mut self, args: &Inserts<'_>) -> SqliteResult<i64> {
-        // For backups, the user should specify tidb_id and description
-        // backup_name will be auto-generated from description or use a default
-        const ARG_OFFSET: usize = 2; // Same offset pattern as clusters
+        // For backups, when only description is provided (single value insert),
+        // we need to handle it specially. When both tidb_id and description are provided,
+        // use the normal column mapping.
+        const ARG_OFFSET: usize = 2;
 
-        // Helper function to get column value using the constant + offset
-        let get_column_value = |col_const: c_int| -> SqliteResult<Option<String>> {
-            args.get::<Option<String>>((col_const + ARG_OFFSET as c_int) as usize)
+        let total_args = args.len();
+        let provided_values = total_args - ARG_OFFSET;
+
+        let (tidb_id, description) = if provided_values == 1 {
+            // Single value provided - assume it's description, and we need a default tidb_id
+            // This is a special case where user provides only description
+            let _description = args.get::<Option<String>>(ARG_OFFSET)?;
+
+            // Return error - we actually need tidb_id to create a backup
+            return Err(rusqlite::Error::InvalidColumnName(
+                "INSERT with single value not supported. Please provide both tidb_id and description: INSERT INTO tidb_backups (tidb_id, description) VALUES ('cluster_id', 'backup_description')".to_string(),
+            ));
+        } else {
+            // Multiple values - use column mapping
+            let get_column_value = |col_const: c_int| -> SqliteResult<Option<String>> {
+                args.get::<Option<String>>((col_const + ARG_OFFSET as c_int) as usize)
+            };
+
+            let tidb_id = get_column_value(COL_BACKUP_TIDB_ID)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "tidb_id is required for creating backups".to_string(),
+                )
+            })?;
+            let description = get_column_value(COL_BACKUP_DESCRIPTION)?;
+            (tidb_id, description)
         };
-
-        // Extract required values
-        let tidb_id = get_column_value(COL_BACKUP_TIDB_ID)?.ok_or_else(|| {
-            rusqlite::Error::InvalidColumnName(
-                "tidb_id is required for creating backups".to_string(),
-            )
-        })?;
-        let description = get_column_value(COL_BACKUP_DESCRIPTION)?;
 
         // Generate backup name from description or use default
         let backup_name = if let Some(ref desc) = description {
@@ -633,104 +762,6 @@ impl UpdateVTab<'_> for TidbBackupsTab {
             Err(e) => Err(rusqlite::Error::ModuleError(format!("Update failed: {e}"))),
         }
     }
-}
-
-/// TiDB Public Endpoints Virtual Table
-#[repr(C)]
-struct TidbPublicEndpointsTab {
-    base: ffi::sqlite3_vtab,
-}
-
-unsafe impl<'vtab> VTab<'vtab> for TidbPublicEndpointsTab {
-    type Aux = ();
-    type Cursor = TidbPublicEndpointsCursor<'vtab>;
-
-    fn connect(
-        _db: &mut VTabConnection,
-        _aux: Option<&Self::Aux>,
-        _args: &[&[u8]],
-    ) -> SqliteResult<(String, Self)> {
-        let schema = r#"
-            CREATE TABLE x(
-                endpoint_id TEXT PRIMARY KEY,
-                tidb_id TEXT,
-                host TEXT,
-                port TEXT,
-                connection_type TEXT,
-                raw_data TEXT
-            )
-        "#
-        .to_owned();
-
-        Ok((
-            schema,
-            Self {
-                base: ffi::sqlite3_vtab::default(),
-            },
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> SqliteResult<()> {
-        let mut tidb_id_idx: Option<usize> = None;
-        let mut endpoint_id_idx: Option<usize> = None;
-
-        // Check which constraints we can handle
-        for (i, c) in info.constraints().enumerate() {
-            if !c.is_usable() {
-                continue;
-            }
-            if c.operator() != IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
-                continue;
-            }
-            match c.column() {
-                COL_ENDPOINT_TIDB_ID => tidb_id_idx = Some(i),
-                COL_ENDPOINT_ID => endpoint_id_idx = Some(i),
-                _ => {}
-            }
-        }
-
-        // Set up constraint usage
-        let mut n = 0i32;
-        if let Some(j) = tidb_id_idx {
-            n += 1;
-            let mut u = info.constraint_usage(j);
-            u.set_argv_index(n);
-            u.set_omit(true);
-        }
-        if let Some(j) = endpoint_id_idx {
-            n += 1;
-            let mut u = info.constraint_usage(j);
-            u.set_argv_index(n);
-            u.set_omit(true);
-        }
-
-        // Set constraint mask
-        let mut mask: c_int = 0;
-        if tidb_id_idx.is_some() {
-            mask |= 1;
-        }
-        if endpoint_id_idx.is_some() {
-            mask |= 2;
-        }
-        info.set_idx_num(mask);
-
-        // Set cost estimate
-        if mask != 0 {
-            info.set_estimated_cost(50.0); // With constraints
-        } else {
-            info.set_estimated_cost(1000.0); // Full table scan
-        }
-
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> SqliteResult<Self::Cursor> {
-        Ok(TidbPublicEndpointsCursor::new())
-    }
-}
-
-impl CreateVTab<'_> for TidbPublicEndpointsTab {
-    const KIND: VTabKind = VTabKind::Default;
 }
 
 /// Cursor for iterating over TiDB clusters
@@ -947,73 +978,302 @@ unsafe impl VTabCursor for TidbBackupsCursor<'_> {
     }
 }
 
-/// Cursor for iterating over TiDB public endpoints
+/// TiDB Network Access Virtual Table
 #[repr(C)]
-struct TidbPublicEndpointsCursor<'vtab> {
-    base: ffi::sqlite3_vtab_cursor,
-    row_id: i64,
-    endpoints: Vec<PublicEndpointData>,
-    current_index: usize,
-    _phantom: PhantomData<&'vtab TidbPublicEndpointsTab>,
+struct TidbNetworkAccessTab {
+    base: ffi::sqlite3_vtab,
 }
 
-impl<'vtab> TidbPublicEndpointsCursor<'vtab> {
+unsafe impl<'vtab> VTab<'vtab> for TidbNetworkAccessTab {
+    type Aux = ();
+    type Cursor = TidbNetworkAccessCursor<'vtab>;
+
+    fn connect(
+        _db: &mut VTabConnection,
+        _aux: Option<&Self::Aux>,
+        _args: &[&[u8]],
+    ) -> SqliteResult<(String, Self)> {
+        let schema = r#"
+            CREATE TABLE x(
+                tidb_id TEXT,
+                enabled TEXT,
+                cidr_notation TEXT,
+                description TEXT,
+                raw_data TEXT
+            )
+        "#
+        .to_owned();
+
+        Ok((
+            schema,
+            Self {
+                base: ffi::sqlite3_vtab::default(),
+            },
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> SqliteResult<()> {
+        let mut tidb_id_idx: Option<usize> = None;
+
+        // Check which constraints we can handle
+        for (i, c) in info.constraints().enumerate() {
+            if !c.is_usable() {
+                continue;
+            }
+            if c.operator() != IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
+                continue;
+            }
+            if c.column() == COL_NETWORK_TIDB_ID {
+                tidb_id_idx = Some(i);
+            }
+        }
+
+        // Set up constraint usage
+        if let Some(j) = tidb_id_idx {
+            let mut u = info.constraint_usage(j);
+            u.set_argv_index(1);
+            u.set_omit(true);
+        }
+
+        // Set constraint mask
+        let mask: c_int = if tidb_id_idx.is_some() { 1 } else { 0 };
+        info.set_idx_num(mask);
+
+        // Set cost estimate
+        if mask != 0 {
+            info.set_estimated_cost(25.0); // With tidb_id constraint
+        } else {
+            info.set_estimated_cost(2500.0); // Full table scan
+        }
+
+        Ok(())
+    }
+
+    fn open(&'vtab mut self) -> SqliteResult<Self::Cursor> {
+        Ok(TidbNetworkAccessCursor::new())
+    }
+}
+
+impl CreateVTab<'_> for TidbNetworkAccessTab {
+    const KIND: VTabKind = VTabKind::Default;
+}
+
+impl UpdateVTab<'_> for TidbNetworkAccessTab {
+    fn insert(&mut self, args: &Inserts<'_>) -> SqliteResult<i64> {
+        // For network access, the user can specify either:
+        // 4 values: tidb_id, cidr_notation, description (enabled defaults to true)
+        // 5 values: tidb_id, enabled, cidr_notation, description (explicit enabled)
+        const ARG_OFFSET: usize = 2; // Same offset pattern as other tables
+
+        let total_args = args.len();
+        let provided_values = total_args - ARG_OFFSET;
+
+        // Helper function to get column value using the constant + offset
+        let get_column_value = |col_const: c_int| -> SqliteResult<Option<String>> {
+            args.get::<Option<String>>((col_const + ARG_OFFSET as c_int) as usize)
+        };
+
+        let (tidb_id, enabled_bool, cidr_notation, description) = if provided_values == 4 {
+            // 4 values provided: tidb_id, cidr_notation, description (skip enabled, default to true)
+            let tidb_id = args.get::<Option<String>>(ARG_OFFSET)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "tidb_id is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            let cidr_notation = args.get::<Option<String>>(ARG_OFFSET + 1)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "cidr_notation is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            let description = args.get::<Option<String>>(ARG_OFFSET + 2)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "description is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            (tidb_id, None, cidr_notation, description) // enabled defaults to true (None)
+        } else {
+            // 5 values provided: use normal column mapping
+            let tidb_id = get_column_value(COL_NETWORK_TIDB_ID)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "tidb_id is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            let cidr_notation = get_column_value(COL_NETWORK_CIDR_NOTATION)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "cidr_notation is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            let description = get_column_value(COL_NETWORK_DESCRIPTION)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName(
+                    "description is required for adding IP to access list".to_string(),
+                )
+            })?;
+
+            // enabled defaults to true, but can be overridden
+            let enabled = get_column_value(COL_NETWORK_ENABLED)?;
+            let enabled_bool = match enabled.as_deref() {
+                Some("false") | Some("0") | Some("no") | Some("off") => Some(false),
+                _ => None, // Will default to true in the add_ip_to_access_list function
+            };
+
+            (tidb_id, enabled_bool, cidr_notation, description)
+        };
+
+        match api_bridge::add_ip_to_access_list(
+            &tidb_id,
+            &cidr_notation,
+            &description,
+            enabled_bool,
+        ) {
+            Ok(()) => {
+                debug!("✅ Added IP to access list: {cidr_notation} for cluster {tidb_id}");
+                Ok(1) // Return a rowid for the new row
+            }
+            Err(e) => Err(rusqlite::Error::ModuleError(format!("Insert failed: {e}"))),
+        }
+    }
+
+    fn delete(&mut self, _rowid: rusqlite::types::ValueRef<'_>) -> SqliteResult<()> {
+        Err(rusqlite::Error::ModuleError(
+            "DELETE not supported on tidb_network_access. Use UPDATE to modify network access settings.".to_string(),
+        ))
+    }
+
+    fn update(&mut self, args: &Updates<'_>) -> SqliteResult<()> {
+        let rowid = args.get::<i64>(0)?;
+
+        // Look up the (tidb_id, cidr_notation) using the global rowid mapping
+        let rowid_map = get_network_access_rowid_map();
+        let network_info = if let Ok(map) = rowid_map.lock() {
+            map.get(&rowid).cloned()
+        } else {
+            None
+        };
+
+        let (tidb_id, _cidr) = match network_info {
+            Some(info) => info,
+            None => {
+                return Err(rusqlite::Error::ModuleError(format!(
+                    "Cannot update network access: no network info found for rowid {rowid}. Try running SELECT first to populate the mapping."
+                )));
+            }
+        };
+
+        // Extract updatable column values using the argument offset pattern
+        const ARG_OFFSET: usize = 2; // Same offset pattern as other operations
+
+        // Helper function to get optional column value
+        let get_column_value = |col_const: c_int| -> SqliteResult<Option<String>> {
+            args.get::<Option<String>>((col_const + ARG_OFFSET as c_int) as usize)
+        };
+
+        // Extract the updatable columns
+        let enabled = get_column_value(COL_NETWORK_ENABLED)?;
+        let cidr_notation = get_column_value(COL_NETWORK_CIDR_NOTATION)?;
+        let description = get_column_value(COL_NETWORK_DESCRIPTION)?;
+
+        // Check if at least one field is being updated
+        if enabled.is_none() && cidr_notation.is_none() && description.is_none() {
+            return Err(rusqlite::Error::ModuleError(
+                "No updatable columns specified. Only enabled, cidr_notation, and description can be updated.".to_string()
+            ));
+        }
+
+        let enabled_str = enabled.unwrap_or_else(|| "true".to_string());
+        let cidr_str = cidr_notation.unwrap_or_else(String::new);
+        let desc_str = description.unwrap_or_else(String::new);
+
+        debug!("🔄 Updating network access for tidb_id {tidb_id} (rowid: {rowid})");
+        debug!("  enabled: {enabled_str}");
+        if !cidr_str.is_empty() {
+            debug!("  cidr_notation: {cidr_str}");
+        }
+        if !desc_str.is_empty() {
+            debug!("  description: {desc_str}");
+        }
+
+        match api_bridge::update_network_access(&tidb_id, &enabled_str, &cidr_str, &desc_str) {
+            Ok(()) => {
+                debug!("✅ Successfully updated network access: {tidb_id}");
+                Ok(())
+            }
+            Err(e) => Err(rusqlite::Error::ModuleError(format!("Update failed: {e}"))),
+        }
+    }
+}
+
+/// Cursor for iterating over TiDB network access settings
+#[repr(C)]
+struct TidbNetworkAccessCursor<'vtab> {
+    base: ffi::sqlite3_vtab_cursor,
+    row_id: i64,
+    network_access: Vec<NetworkAccessData>,
+    current_index: usize,
+    _phantom: PhantomData<&'vtab TidbNetworkAccessTab>,
+}
+
+impl<'vtab> TidbNetworkAccessCursor<'vtab> {
     fn new() -> Self {
         Self {
             base: ffi::sqlite3_vtab_cursor::default(),
             row_id: 1,
-            endpoints: Vec::new(),
+            network_access: Vec::new(),
             current_index: 0,
             _phantom: PhantomData,
         }
     }
 
-    fn fetch_endpoints_from_api(&mut self, _constraints: &Filters<'_>) -> SqliteResult<()> {
+    fn fetch_network_access_from_api(&mut self, _constraints: &Filters<'_>) -> SqliteResult<()> {
         // Fetch from API - this must succeed
-        let endpoints = self.try_fetch_endpoints_from_api()?;
-        self.endpoints = endpoints;
+        let network_access = self.try_fetch_network_access_from_api()?;
+        self.network_access = network_access;
 
-        // Update the global rowid to (tidb_id, endpoint_id) mapping
-        let rowid_map = get_public_endpoint_rowid_map();
+        // Update the global rowid to (tidb_id, cidr_notation) mapping
+        let rowid_map = get_network_access_rowid_map();
         if let Ok(mut map) = rowid_map.lock() {
             map.clear(); // Clear old mappings
-            for (index, endpoint) in self.endpoints.iter().enumerate() {
+            for (index, access) in self.network_access.iter().enumerate() {
                 let rowid = (index + 1) as i64; // rowid starts from 1
                 map.insert(
                     rowid,
-                    (endpoint.tidb_id.clone(), endpoint.endpoint_id.clone()),
+                    (access.tidb_id.clone(), access.cidr_notation.clone()),
                 );
             }
             debug!(
-                "✅ Updated public endpoint rowid mapping for {} endpoints",
-                self.endpoints.len()
+                "✅ Updated network access rowid mapping for {} entries",
+                self.network_access.len()
             );
         }
 
         debug!(
-            "✅ Fetched {} public endpoints from TiDB Cloud API",
-            self.endpoints.len()
+            "✅ Fetched {} network access entries from TiDB Cloud API",
+            self.network_access.len()
         );
         self.current_index = 0;
         Ok(())
     }
 
-    fn try_fetch_endpoints_from_api(&self) -> SqliteResult<Vec<PublicEndpointData>> {
-        match api_bridge::fetch_public_endpoints() {
-            Ok(endpoints) => Ok(endpoints),
+    fn try_fetch_network_access_from_api(&self) -> SqliteResult<Vec<NetworkAccessData>> {
+        match api_bridge::fetch_network_access() {
+            Ok(network_access) => Ok(network_access),
             Err(e) => Err(rusqlite::Error::ModuleError(e)),
         }
     }
 }
 
-unsafe impl VTabCursor for TidbPublicEndpointsCursor<'_> {
+unsafe impl VTabCursor for TidbNetworkAccessCursor<'_> {
     fn filter(
         &mut self,
         _idx_num: c_int,
         _idx_str: Option<&str>,
         _args: &Filters<'_>,
     ) -> SqliteResult<()> {
-        self.fetch_endpoints_from_api(_args)?;
+        self.fetch_network_access_from_api(_args)?;
         self.row_id = 1;
         Ok(())
     }
@@ -1025,7 +1285,7 @@ unsafe impl VTabCursor for TidbPublicEndpointsCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.current_index >= self.endpoints.len()
+        self.current_index >= self.network_access.len()
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> SqliteResult<()> {
@@ -1033,14 +1293,331 @@ unsafe impl VTabCursor for TidbPublicEndpointsCursor<'_> {
             return Ok(());
         }
 
-        let endpoint = &self.endpoints[self.current_index];
+        let access = &self.network_access[self.current_index];
         let value = match i {
-            COL_ENDPOINT_ID => &endpoint.endpoint_id,
-            COL_ENDPOINT_TIDB_ID => &endpoint.tidb_id,
-            COL_HOST => &endpoint.host,
-            COL_PORT => &endpoint.port,
-            COL_CONNECTION_TYPE => &endpoint.connection_type,
-            COL_ENDPOINT_RAW_DATA => &endpoint.raw_data,
+            COL_NETWORK_TIDB_ID => &access.tidb_id,
+            COL_NETWORK_ENABLED => &access.enabled,
+            COL_NETWORK_CIDR_NOTATION => &access.cidr_notation,
+            COL_NETWORK_DESCRIPTION => &access.description,
+            COL_NETWORK_RAW_DATA => &access.raw_data,
+            _ => return Ok(()),
+        };
+
+        ctx.set_result(value)?;
+        Ok(())
+    }
+
+    fn rowid(&self) -> SqliteResult<i64> {
+        Ok(self.row_id)
+    }
+}
+
+/// Cluster-specific Network Access Virtual Table (e.g., tidb_123_access_list)
+#[repr(C)]
+struct TidbClusterNetworkAccessTab {
+    base: ffi::sqlite3_vtab,
+    cluster_id: String,
+}
+
+unsafe impl<'vtab> VTab<'vtab> for TidbClusterNetworkAccessTab {
+    type Aux = String; // cluster_id as auxiliary data
+    type Cursor = TidbClusterNetworkAccessCursor<'vtab>;
+
+    fn connect(
+        _db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _args: &[&[u8]],
+    ) -> SqliteResult<(String, Self)> {
+        let cluster_id = aux
+            .ok_or_else(|| {
+                rusqlite::Error::ModuleError(
+                    "cluster_id required for cluster-specific access table".to_string(),
+                )
+            })?
+            .clone();
+
+        let vtab = Self {
+            base: ffi::sqlite3_vtab::default(),
+            cluster_id,
+        };
+
+        let schema = "CREATE TABLE x(cidr_notation TEXT UNIQUE, description TEXT, enabled TEXT, tidb_id TEXT, raw_data TEXT)";
+        Ok((schema.to_string(), vtab))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> SqliteResult<()> {
+        // Always scan all rows for this cluster
+        info.set_estimated_cost(100.0);
+        info.set_estimated_rows(100);
+        Ok(())
+    }
+
+    fn open(&'vtab mut self) -> SqliteResult<Self::Cursor> {
+        Ok(TidbClusterNetworkAccessCursor::new(self.cluster_id.clone()))
+    }
+}
+
+impl CreateVTab<'_> for TidbClusterNetworkAccessTab {
+    const KIND: VTabKind = VTabKind::Default;
+}
+
+impl UpdateVTab<'_> for TidbClusterNetworkAccessTab {
+    fn insert(&mut self, args: &Inserts<'_>) -> SqliteResult<i64> {
+        const ARG_OFFSET: usize = 2;
+
+        // Count only non-None values after ARG_OFFSET
+        let mut provided_values = 0;
+        for i in ARG_OFFSET..args.len() {
+            if args.get::<Option<String>>(i).unwrap_or(None).is_some() {
+                provided_values += 1;
+            }
+        }
+
+        let (enabled_bool, cidr_notation, description) = if provided_values == 2 {
+            // 2 values for cluster-specific table: cidr_notation, description
+            // With schema: cidr_notation TEXT, description TEXT, enabled TEXT, tidb_id TEXT, raw_data TEXT
+            let cidr_notation = args.get::<Option<String>>(ARG_OFFSET)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("cidr_notation is required".to_string())
+            })?;
+
+            let description = args.get::<Option<String>>(ARG_OFFSET + 1)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("description is required".to_string())
+            })?;
+
+            (None, cidr_notation, description) // enabled defaults to true, other fields auto-generated
+        } else if provided_values == 3 {
+            // 3 values: cidr_notation, description, enabled
+            let cidr_notation = args.get::<Option<String>>(ARG_OFFSET)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("cidr_notation is required".to_string())
+            })?;
+
+            let description = args.get::<Option<String>>(ARG_OFFSET + 1)?.ok_or_else(|| {
+                rusqlite::Error::InvalidColumnName("description is required".to_string())
+            })?;
+
+            let enabled = args.get::<Option<String>>(ARG_OFFSET + 2)?;
+            let enabled_bool = match enabled.as_deref() {
+                Some("false") | Some("0") | Some("no") | Some("off") => Some(false),
+                _ => None,
+            };
+
+            (enabled_bool, cidr_notation, description)
+        } else {
+            return Err(rusqlite::Error::InvalidColumnName(
+                "cluster-specific access table expects 2-3 values (cidr_notation, description, [enabled])".to_string()
+            ));
+        };
+
+        // Check for existing CIDR entries to prevent duplicates
+        match api_bridge::fetch_network_access() {
+            Ok(network_access) => {
+                // Check if this CIDR already exists for this cluster
+                let duplicate_exists = network_access.iter().any(|entry| {
+                    entry.tidb_id == self.cluster_id && entry.cidr_notation == cidr_notation
+                });
+
+                if duplicate_exists {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+                        Some(format!(
+                            "UNIQUE constraint failed: tidb_{}_network_access.cidr_notation",
+                            self.cluster_id
+                        )),
+                    ));
+                }
+            }
+            Err(e) => {
+                debug!("Warning: Could not check for duplicates: {}", e);
+                // Continue with insert attempt - API might catch duplicate
+            }
+        }
+
+        match api_bridge::add_ip_to_access_list(
+            &self.cluster_id,
+            &cidr_notation,
+            &description,
+            enabled_bool,
+        ) {
+            Ok(()) => {
+                debug!(
+                    "✅ Added IP to cluster {} access list: {}",
+                    self.cluster_id, cidr_notation
+                );
+                Ok(1)
+            }
+            Err(e) => Err(rusqlite::Error::ModuleError(format!("Insert failed: {e}"))),
+        }
+    }
+
+    fn delete(&mut self, rowid: rusqlite::types::ValueRef<'_>) -> SqliteResult<()> {
+        let rowid_value: i64 = rowid.as_i64()?;
+
+        // Get the network access mapping to find the CIDR to delete
+        let network_map = get_network_access_rowid_map();
+        if let Ok(map) = network_map.lock()
+            && let Some((tidb_id, cidr_notation)) = map.get(&rowid_value)
+            && tidb_id == &self.cluster_id
+        {
+            match api_bridge::remove_ip_from_access_list(tidb_id, cidr_notation) {
+                Ok(()) => {
+                    debug!(
+                        "✅ Removed IP from cluster {} access list: {}",
+                        self.cluster_id, cidr_notation
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(rusqlite::Error::ModuleError(format!("Delete failed: {e}")));
+                }
+            }
+        }
+
+        Err(rusqlite::Error::ModuleError(
+            "Could not find network access entry to delete".to_string(),
+        ))
+    }
+
+    fn update(&mut self, args: &Updates<'_>) -> SqliteResult<()> {
+        let rowid = args.get::<i64>(0)?;
+
+        // Get updated values - only support updating description and enabled status
+        let new_enabled = args.get::<Option<String>>(2)?; // enabled column
+        let new_description = args.get::<Option<String>>(4)?; // description column
+
+        let network_map = get_network_access_rowid_map();
+        if let Ok(map) = network_map.lock()
+            && let Some((tidb_id, cidr_notation)) = map.get(&rowid)
+            && tidb_id == &self.cluster_id
+        {
+            let enabled_bool = match new_enabled.as_deref() {
+                Some("false") | Some("0") | Some("no") | Some("off") => Some(false),
+                Some("true") | Some("1") | Some("yes") | Some("on") => Some(true),
+                _ => None,
+            };
+
+            match api_bridge::update_access_list_entry(
+                tidb_id,
+                cidr_notation,
+                new_description.as_deref(),
+                enabled_bool,
+            ) {
+                Ok(()) => {
+                    debug!(
+                        "✅ Updated access list entry for cluster {}: {}",
+                        self.cluster_id, cidr_notation
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(rusqlite::Error::ModuleError(format!("Update failed: {e}")));
+                }
+            }
+        }
+
+        Err(rusqlite::Error::ModuleError(
+            "Could not find network access entry to update".to_string(),
+        ))
+    }
+}
+
+/// Cursor for cluster-specific network access virtual table
+#[repr(C)]
+struct TidbClusterNetworkAccessCursor<'vtab> {
+    base: ffi::sqlite3_vtab_cursor,
+    row_id: i64,
+    network_access: Vec<NetworkAccessData>,
+    current_index: usize,
+    cluster_id: String,
+    _phantom: PhantomData<&'vtab TidbClusterNetworkAccessTab>,
+}
+
+impl<'vtab> TidbClusterNetworkAccessCursor<'vtab> {
+    fn new(cluster_id: String) -> Self {
+        Self {
+            base: ffi::sqlite3_vtab_cursor::default(),
+            row_id: 1,
+            network_access: Vec::new(),
+            current_index: 0,
+            cluster_id,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn fetch_cluster_network_access(&mut self) -> SqliteResult<()> {
+        match api_bridge::fetch_network_access() {
+            Ok(all_access) => {
+                // Filter to only include entries for this cluster
+                self.network_access = all_access
+                    .into_iter()
+                    .filter(|access| access.tidb_id == self.cluster_id)
+                    .collect();
+
+                // Update the global rowid mapping for this cluster's entries
+                let network_map = get_network_access_rowid_map();
+                if let Ok(mut map) = network_map.lock() {
+                    for (index, access) in self.network_access.iter().enumerate() {
+                        let rowid = (index + 1) as i64;
+                        map.insert(
+                            rowid,
+                            (access.tidb_id.clone(), access.cidr_notation.clone()),
+                        );
+                    }
+                }
+
+                debug!(
+                    "Fetched {} network access entries for cluster {}",
+                    self.network_access.len(),
+                    self.cluster_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to fetch network access for cluster {}: {}",
+                    self.cluster_id, e
+                );
+                Err(rusqlite::Error::ModuleError(format!(
+                    "API fetch failed: {e}"
+                )))
+            }
+        }
+    }
+}
+
+unsafe impl VTabCursor for TidbClusterNetworkAccessCursor<'_> {
+    fn filter(
+        &mut self,
+        _idx_num: c_int,
+        _idx_str: Option<&str>,
+        _args: &Filters<'_>,
+    ) -> SqliteResult<()> {
+        self.fetch_cluster_network_access()?;
+        self.row_id = 1;
+        Ok(())
+    }
+
+    fn next(&mut self) -> SqliteResult<()> {
+        self.current_index += 1;
+        self.row_id += 1;
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        self.current_index >= self.network_access.len()
+    }
+
+    fn column(&self, ctx: &mut Context, i: c_int) -> SqliteResult<()> {
+        if self.eof() {
+            return Ok(());
+        }
+
+        let access = &self.network_access[self.current_index];
+        let value = match i {
+            0 => &access.cidr_notation, // Column 0: cidr_notation
+            1 => &access.description,   // Column 1: description
+            2 => &access.enabled,       // Column 2: enabled
+            3 => &access.tidb_id,       // Column 3: tidb_id
+            4 => &access.raw_data,      // Column 4: raw_data
             _ => return Ok(()),
         };
 

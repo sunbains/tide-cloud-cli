@@ -109,6 +109,18 @@ impl TiDBCloudClient {
         self.reset_root_password(tidb_id, new_password).await
     }
 
+    /// Get public connection settings for a TiDB cluster
+    pub async fn get_public_connection(
+        &mut self,
+        tidb_id: &str,
+    ) -> TiDBCloudResult<PublicConnectionResponse> {
+        let path = PathBuilder::new()
+            .tidb_id(tidb_id)
+            .public_connection_setting()
+            .build();
+        self.get(&path, None).await
+    }
+
     /// Update public connection settings for a TiDB cluster
     pub async fn update_public_connection(
         &mut self,
@@ -199,7 +211,9 @@ impl TiDBCloudClient {
         request: &CreateBackupRequest,
     ) -> TiDBCloudResult<Backup> {
         let path = PathBuilder::new().tidb_id(tidb_id).backups().build();
-        self.post(&path, Some(request)).await
+        // Convert the request to query parameters for GET request
+        let query = self.build_query_string(request)?;
+        self.get(&path, Some(&query)).await
     }
 
     /// Update a backup
@@ -334,7 +348,7 @@ impl TiDBCloudClient {
     }
 
     /// Wait for a TiDB cluster to be active
-    pub async fn wait_for_tidb_active(&mut self, tidb_id: &str) -> TiDBCloudResult<Tidb> {
+    pub async fn wait_for_active_state(&mut self, tidb_id: &str) -> TiDBCloudResult<Tidb> {
         self.wait_for_tidb_state(
             tidb_id,
             ClusterState::Active,
@@ -349,7 +363,7 @@ impl TiDBCloudClient {
         let created_tidb = self.create_tidb(tidb, None).await?;
 
         if let Some(tidb_id) = &created_tidb.tidb_id {
-            self.wait_for_tidb_active(tidb_id).await
+            self.wait_for_active_state(tidb_id).await
         } else {
             Ok(created_tidb)
         }

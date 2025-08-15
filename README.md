@@ -93,21 +93,25 @@ CREATE TABLE tidb_backups (
 - ✅ **UPDATE**: Modify backup description (triggers `update_backup` API)
 - ✅ **DELETE**: Remove backups (triggers `delete_backup` API)
 
-#### 3. `tidb_public_endpoints`
-**Schema**: Public endpoint information extracted from clusters
+#### 3. `tidb_endpoints`
+**Schema**: Endpoint information extracted from cluster raw_data (materialized view)
 ```sql
-CREATE TABLE tidb_public_endpoints (
-    endpoint_id TEXT,       -- Endpoint identifier
-    tidb_id TEXT,          -- Foreign key to clusters
-    host TEXT,              -- Host address
-    port TEXT,              -- Port number
-    connection_type TEXT,   -- Connection type
-    raw_data TEXT           -- Full JSON response
-);
+CREATE VIEW tidb_endpoints AS
+    SELECT 
+        json_extract(endpoint.value, '$.host') || ':' || json_extract(endpoint.value, '$.port') as endpoint_id,
+        tidb_id,
+        json_extract(endpoint.value, '$.host') as host,
+        json_extract(endpoint.value, '$.port') as port,
+        json_extract(endpoint.value, '$.connectionType') as connection_type,
+        endpoint.value as raw_data
+    FROM tidb_clusters,
+    json_each(json_extract(raw_data, '$.endpoints')) as endpoint
+    WHERE json_extract(endpoint.value, '$.host') IS NOT NULL
+    AND json_extract(endpoint.value, '$.port') IS NOT NULL;
 ```
 
 **Supported Operations**:
-- ✅ **SELECT**: Query endpoints (read-only)
+- ✅ **SELECT**: Query endpoints (standard SQL view)
 - 🔒 **INSERT/UPDATE/DELETE**: Not supported (endpoints managed via clusters)
 
 ### Example Queries
@@ -147,12 +151,12 @@ GROUP BY c.tidb_id, c.display_name;
 #### Endpoint Information
 ```sql
 -- List all public endpoints
-SELECT * FROM tidb_public_endpoints WHERE connection_type = 'PUBLIC';
+SELECT * FROM tidb_endpoints WHERE connection_type = 'Public';
 
 -- Join clusters with their endpoints
 SELECT c.display_name, pe.host, pe.port, pe.connection_type
 FROM tidb_clusters c
-JOIN tidb_public_endpoints pe ON c.tidb_id = pe.tidb_id;
+JOIN tidb_endpoints pe ON c.tidb_id = pe.tidb_id;
 ```
 
 ### Data Modification Operations
@@ -233,21 +237,14 @@ DELETE FROM tidb_backups WHERE tidb_id = 'cluster-123';
 --log-file-path <PATH>              # Log file path
 ```
 
-### Commands
+### Usage
 
+The CLI starts the interactive SQL shell directly. No subcommands are needed.
+
+**For Scripts**: Use Unix pipes to execute SQL commands non-interactively:
 ```bash
-# Interactive SQL shell
-shell                               # Start interactive SQL shell
-
-# Execute SQL queries directly
-query <SQL_QUERY>                   # Execute a single SQL query
-
-# Execute SQL from file
-script <FILE>                       # Execute SQL script from a file
-
-# Show available tables and schemas
-show-tables                         # List all available virtual tables
-examples                            # Show SQL query examples
+echo "SELECT * FROM tidb_clusters;" | tidb-cli --username user --password pass
+cat script.sql | tidb-cli --username user --password pass
 ```
 
 ### Examples
@@ -255,19 +252,18 @@ examples                            # Show SQL query examples
 ```bash
 # Start interactive SQL shell
 tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tidbapi.com/v1beta2 shell
-
-# Execute single SQL query
-tidb-cli --username myuser --password myapikey \
-         --base-url https://cloud.dev.tidbapi.com/v1beta2 \
-         query "SELECT * FROM tidb_clusters WHERE state = 'ACTIVE'"
+         --base-url https://cloud.dev.tidbapi.com/v1beta2
 
 # Verbose logging with debug level
 tidb-cli --username myuser --password myapikey \
          --base-url https://cloud.dev.tidbapi.com/v1beta2 \
          --verbose \
-         --log-level debug \
-         shell
+         --log-level debug
+
+# Using environment variables
+export TIDB_CLOUD_USERNAME="myuser"
+export TIDB_CLOUD_PASSWORD="myapikey"
+tidb-cli
 ```
 
 ## Virtual Table Implementation Details
@@ -277,7 +273,7 @@ tidb-cli --username myuser --password myapikey \
 - **`TidbClustersTab`**: Implements `VTab`, `CreateVTab`, `UpdateVTab`, `DeleteVTab`
 - **`TidbClustersCursor`**: Implements `VTabCursor` for data iteration
 - **`TidbBackupsTab`**: Similar implementation for backup operations
-- **`TidbPublicEndpointsTab`**: Read-only virtual table for endpoint data
+- **`tidb_endpoints`**: Materialized view over tidb_clusters raw_data JSON
 
 ### Key Methods
 
