@@ -133,9 +133,9 @@ fn fetch_fresh_data_from_api(
         "#,
     )?;
 
-    // Register custom SQLite function for check_if_cluster_is_active
+    // Register custom SQLite function for wait_for_cluster_to_become_active
     conn.create_scalar_function(
-        "check_if_cluster_is_active",
+        "wait_for_cluster_to_become_active",
         1,
         rusqlite::functions::FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -152,10 +152,10 @@ fn fetch_fresh_data_from_api(
 
             if let Some(row) = rows.next()? {
                 let state: String = row.get(0)?;
-                if state.to_lowercase() == "active" {
-                    return Ok("ACTIVE".to_string());
-                } else {
+                if state.to_lowercase() != "creating" {
                     return Ok(state);
+                } else {
+                    return Ok("CREATING".to_string());
                 }
             }
 
@@ -164,11 +164,11 @@ fn fetch_fresh_data_from_api(
     )?;
 
     println!("Virtual tables ready for data access");
-    println!("Custom function 'check_if_cluster_is_active(display_name)' registered");
+    println!("Custom function 'wait_for_cluster_to_become_active(display_name)' registered");
     Ok(())
 }
 
-fn wait_for_active_state(
+fn wait_for_cluster_to_become_active(
     conn: &mut SQLiteConnection,
     display_name: &str,
 ) -> Result<Option<(String, i32)>, Box<dyn std::error::Error>> {
@@ -182,14 +182,14 @@ fn wait_for_active_state(
 
         if let Some(row) = rows.next()? {
             let state: String = row.get(0)?;
-            if state.to_lowercase() == "active" {
+            if state.to_lowercase() != "creating" {
                 return Ok(Some((state, iteration)));
             }
         }
 
         iteration += 1;
         println!(
-            "Time elapsed: {:?} - Cluster '{}' not active yet, sleeping...",
+            "Time elapsed: {:?} - Cluster '{}' still creating, sleeping...",
             start_time.elapsed(),
             display_name
         );
@@ -337,7 +337,9 @@ fn show_virtual_tables_with_client(
     println!("  .reload  - Drop all tables and recreate with fresh data from API");
     println!("  .tables  - Show available tables");
     println!("  .schema  - Show table schemas");
-    println!("  call check_cluster_is_active('name');  - Poll until cluster state is active");
+    println!(
+        "  call wait_for_cluster_to_become_active('name');  - Poll until cluster is no longer creating"
+    );
     println!();
     println!("{}", "Example Queries:".yellow());
     println!("  SELECT * FROM tidb_clusters WHERE state = 'ACTIVE';");
@@ -722,7 +724,8 @@ fn execute_query(
             return Ok(());
         }
         _ => {
-            if input.starts_with("call check_cluster_is_active(") && input.ends_with(");") {
+            if input.starts_with("call wait_for_cluster_to_become_active(") && input.ends_with(");")
+            {
                 let display_name = input
                     .strip_prefix("call ")
                     .unwrap()
@@ -730,11 +733,11 @@ fn execute_query(
                     .unwrap();
                 if display_name.is_empty() {
                     println!(
-                        "{}: Usage: call check_cluster_is_active(<display_name>)",
+                        "{}: Usage: call wait_for_cluster_to_become_active(<display_name>)",
                         "Error".red()
                     );
                 } else {
-                    match wait_for_active_state(conn, display_name) {
+                    match wait_for_cluster_to_become_active(conn, display_name) {
                         Ok(Some((state, iterations))) => {
                             println!(
                                 "✅ Cluster '{display_name}' is now {state} (checked {iterations} times)"
@@ -742,7 +745,7 @@ fn execute_query(
                         }
                         Ok(None) => {
                             println!(
-                                "❌ Cluster '{display_name}' did not become active within maximum iterations"
+                                "❌ Cluster '{display_name}' is still creating after maximum iterations"
                             );
                         }
                         Err(e) => {
@@ -753,8 +756,8 @@ fn execute_query(
                 return Ok(());
             }
 
-            if let Some(display_name) = parse_check_cluster_is_active_call(input) {
-                match wait_for_active_state(conn, &display_name) {
+            if let Some(display_name) = parse_wait_for_cluster_to_become_active_call(input) {
+                match wait_for_cluster_to_become_active(conn, &display_name) {
                     Ok(Some((state, iterations))) => {
                         println!(
                             "✅ Cluster '{display_name}' is now {state} (checked {iterations} times)"
@@ -833,14 +836,14 @@ fn execute_query(
     Ok(())
 }
 
-fn parse_check_cluster_is_active_call(input: &str) -> Option<String> {
+fn parse_wait_for_cluster_to_become_active_call(input: &str) -> Option<String> {
     let input = input.trim().to_lowercase();
 
-    if !input.starts_with("call check_cluster_is_active") {
+    if !input.starts_with("call wait_for_cluster_to_become_active") {
         return None;
     }
 
-    let after_call = input.strip_prefix("call check_cluster_is_active")?;
+    let after_call = input.strip_prefix("call wait_for_cluster_to_become_active")?;
     let after_call = after_call.trim();
 
     if !after_call.starts_with('(') || !after_call.ends_with(");") && !after_call.ends_with(')') {
