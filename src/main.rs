@@ -142,24 +142,34 @@ fn fetch_fresh_data_from_api(
             let display_name: String = ctx.get(0)?;
 
             // Get a mutable connection - this is tricky within a function
-            // For now, we'll use a simpler approach with a direct query
             let conn_ptr = unsafe { ctx.get_connection()? };
 
-            // Execute the query directly
-            let mut stmt =
-                conn_ptr.prepare("SELECT state FROM tidb_clusters WHERE display_name = ?1")?;
-            let mut rows = stmt.query([&display_name])?;
+            let mut iteration = 1;
+            const MAX_ITERATIONS: i32 = 100;
 
-            if let Some(row) = rows.next()? {
-                let state: String = row.get(0)?;
-                if state.to_lowercase() != "creating" {
-                    return Ok(state);
+            while iteration <= MAX_ITERATIONS {
+                // Execute the query directly
+                let mut stmt =
+                    conn_ptr.prepare("SELECT state FROM tidb_clusters WHERE display_name = ?1")?;
+                let mut rows = stmt.query([&display_name])?;
+
+                if let Some(row) = rows.next()? {
+                    let state: String = row.get(0)?;
+                    if state.to_lowercase() != "creating" {
+                        return Ok(state);
+                    }
                 } else {
-                    return Ok("CREATING".to_string());
+                    return Ok("NOT_FOUND".to_string());
                 }
+
+                iteration += 1;
+
+                // Sleep for 1 second before next check
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
 
-            Ok("NOT_FOUND".to_string())
+            // If we've reached max iterations and still creating
+            Ok("CREATING".to_string())
         },
     )?;
 
